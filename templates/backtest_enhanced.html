@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>策略回测 - 加密货币</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f0f2f5; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; text-align: center; }
+        .header h1 { font-size: 26px; margin-bottom: 6px; }
+        .header p { font-size: 14px; opacity: 0.85; }
+        .nav { background: white; padding: 10px 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); display: flex; gap: 20px; align-items: center; }
+        .nav a { color: #667eea; text-decoration: none; font-weight: 600; font-size: 14px; }
+        .nav a:hover { text-decoration: underline; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .section-title { font-size: 15px; font-weight: 700; color: #333; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #667eea; display: flex; align-items: center; gap: 8px; }
+        .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 2px solid #e0e0e0; }
+        .tab { padding: 10px 22px; cursor: pointer; border: none; background: transparent; color: #666; font-weight: 600; font-size: 14px; transition: all 0.2s; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+        .tab:hover { color: #667eea; }
+        .tab.active { color: #667eea; border-bottom-color: #667eea; background: transparent; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .form-row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; margin-bottom: 14px; }
+        .form-group { display: flex; flex-direction: column; gap: 5px; }
+        .form-group label { font-size: 13px; font-weight: 600; color: #555; }
+        select, input[type="number"], input[type="date"], input[type="text"] {
+            padding: 7px 12px; border-radius: 6px; border: 1px solid #ddd; font-size: 13px; transition: border 0.2s; min-width: 120px;
+        }
+        select:focus, input:focus { border-color: #667eea; outline: none; }
+        .btn { padding: 9px 20px; border-radius: 6px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a6fd6; transform: translateY(-1px); }
+        .btn-primary:disabled { background: #bbb; cursor: not-allowed; transform: none; }
+        .btn-secondary { background: #48bb78; color: white; }
+        .btn-secondary:hover { background: #38a169; }
+        .btn-warning { background: #ed8936; color: white; }
+        .btn-warning:hover { background: #dd6b20; }
+        .strategy-desc { background: #f0f4ff; border-left: 4px solid #667eea; padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 10px 0 14px 0; font-size: 13px; color: #444; line-height: 1.7; }
+        .strategy-desc strong { color: #667eea; }
+        .params-box { background: #f8f9fa; border-radius: 8px; padding: 14px; margin-top: 8px; }
+        .params-box .section-title { font-size: 13px; margin-bottom: 10px; border-bottom-color: #ccc; color: #666; }
+        .param-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+        .param-row label { min-width: 130px; font-size: 13px; color: #555; font-weight: 500; }
+        .param-row input, .param-row select { max-width: 140px; }
+        .param-hint { font-size: 11px; color: #888; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+        .metric-card { background: linear-gradient(135deg, #f5f7fa, #e8ecf5); border-radius: 10px; padding: 14px; text-align: center; border-left: 4px solid #667eea; }
+        .metric-card h5 { font-size: 11px; color: #777; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }
+        .metric-value { font-size: 22px; font-weight: 700; color: #333; }
+        .metric-value.positive { color: #27ae60; }
+        .metric-value.negative { color: #e74c3c; }
+        .metric-value.neutral { color: #2980b9; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        table th, table td { padding: 10px 12px; text-align: center; border-bottom: 1px solid #f0f0f0; }
+        table th { background: #f8f9fa; font-weight: 600; color: #444; white-space: nowrap; }
+        table tr:hover { background: #fafafa; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .badge-long { background: #d4edda; color: #155724; }
+        .badge-short { background: #f8d7da; color: #721c24; }
+        .badge-profit { background: #d4edda; color: #155724; }
+        .badge-loss { background: #f8d7da; color: #721c24; }
+        .chart-container { text-align: center; margin-top: 16px; }
+        .chart-container img { max-width: 100%; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.12); }
+        .log-box { background: #1a1a2e; color: #00d4aa; font-family: 'Courier New', monospace; padding: 12px 16px; border-radius: 8px; max-height: 220px; overflow-y: auto; font-size: 12px; }
+        .log-entry { margin-bottom: 3px; padding: 2px 0; }
+        .log-entry.error { color: #ff6b6b; }
+        .log-entry.success { color: #51cf66; }
+        .log-entry.warning { color: #ffd43b; }
+        .spinner { display: inline-block; width: 18px; height: 18px; border: 3px solid #e0e0e0; border-top: 3px solid #667eea; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+        .compare-table th, .compare-table td { padding: 10px 14px; }
+        .compare-table .best { background: #d4edda !important; font-weight: 700; }
+        .strategy-checkbox-list { display: flex; flex-wrap: wrap; gap: 10px; }
+        .strategy-checkbox-item { display: flex; align-items: center; gap: 6px; padding: 6px 12px; background: #f0f0f0; border-radius: 20px; cursor: pointer; font-size: 13px; }
+        .strategy-checkbox-item input { cursor: pointer; }
+        .empty-state { text-align: center; padding: 40px; color: #aaa; font-size: 15px; }
+        .trades-count-badge { background: #667eea; color: white; border-radius: 12px; padding: 2px 10px; font-size: 12px; margin-left: 8px; }
+    </style>
+</head>
+<body>
+<div class="header">
+    <h1>策略回测系统</h1>
+    <p>趋势跟踪 · 均值回归 · 蒙特卡洛 · 策略组合 · 调仓记录</p>
+</div>
+<div class="nav">
+    <a href="/">← 返回首页</a>
+    <a href="/portfolio">📊 模拟持仓</a>
+</div>
+
+<div class="container">
+    <!-- 控制面板 -->
+    <div class="card">
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('single')">单策略回测</div>
+            <div class="tab" onclick="switchTab('compare')">策略对比</div>
+        </div>
+
+        <!-- 单策略 -->
+        <div id="singleTab" class="tab-content active">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>币种</label>
+                    <select id="assetSelect">
+                        <option value="BTC">BTC</option>
+                        <option value="ETH">ETH</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>策略类型</label>
+                    <select id="strategySelect" onchange="onStrategyChange()">
+                        <option value="trend_following">趋势跟踪</option>
+                        <option value="mean_reversion">均值回归</option>
+                        <option value="monte_carlo">蒙特卡洛</option>
+                        <option value="ensemble">策略组合</option>
+                        <option value="regime_aware">状态感知</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>开始日期</label>
+                    <input type="date" id="startDate" value="2023-01-01">
+                </div>
+                <div class="form-group">
+                    <label>结束日期</label>
+                    <input type="date" id="endDate">
+                </div>
+            </div>
+
+            <!-- 策略说明 -->
+            <div id="strategyDesc" class="strategy-desc"></div>
+
+            <!-- 策略专属参数 -->
+            <div id="strategyParams"></div>
+
+            <!-- 引擎参数（通用） -->
+            <div class="params-box">
+                <div class="section-title">风控参数</div>
+                <div class="form-row">
+                    <div class="param-row">
+                        <label>初始资金 ($)</label>
+                        <input type="number" id="initialCapital" value="10000" min="1000" step="1000">
+                    </div>
+                    <div class="param-row">
+                        <label>仓位比例</label>
+                        <input type="number" id="positionSize" value="0.8" min="0.1" max="1" step="0.05">
+                        <span class="param-hint">0.8 = 80%</span>
+                    </div>
+                    <div class="param-row">
+                        <label>止损 (%)</label>
+                        <input type="number" id="stopLoss" value="10" min="1" max="50">
+                    </div>
+                    <div class="param-row">
+                        <label>止盈 (%)</label>
+                        <input type="number" id="takeProfit" value="20" min="1" max="200">
+                    </div>
+                    <div class="param-row">
+                        <label>移动止损 (%)</label>
+                        <input type="number" id="trailingStop" value="8" min="1" max="30">
+                    </div>
+                    <div class="param-row">
+                        <label>最大持仓天数</label>
+                        <input type="number" id="maxHoldDays" value="30" min="1" max="180">
+                    </div>
+                    <div class="param-row">
+                        <label>再平衡频率</label>
+                        <select id="rebalanceFreq">
+                            <option value="daily">每日</option>
+                            <option value="weekly">每周</option>
+                        </select>
+                    </div>
+                    <div class="param-row">
+                        <label>使用复利</label>
+                        <input type="checkbox" id="useCompound" checked style="width:auto;min-width:0;">
+                    </div>
+                </div>
+            </div>
+
+            <div style="margin-top:16px; display:flex; gap:10px;">
+                <button class="btn btn-primary" onclick="runBacktest()" id="runBtn">▶ 运行回测</button>
+            </div>
+        </div>
+
+        <!-- 策略对比 -->
+        <div id="compareTab" class="tab-content">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>币种</label>
+                    <select id="compareAsset">
+                        <option value="BTC">BTC</option>
+                        <option value="ETH">ETH</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>开始日期</label>
+                    <input type="date" id="compareStartDate" value="2023-01-01">
+                </div>
+                <div class="form-group">
+                    <label>结束日期</label>
+                    <input type="date" id="compareEndDate">
+                </div>
+            </div>
+            <div class="section-title" style="margin-top:10px;">选择策略</div>
+            <div class="strategy-checkbox-list" style="margin-bottom:16px;">
+                <label class="strategy-checkbox-item"><input type="checkbox" value="trend_following" checked> 趋势跟踪</label>
+                <label class="strategy-checkbox-item"><input type="checkbox" value="mean_reversion" checked> 均值回归</label>
+                <label class="strategy-checkbox-item"><input type="checkbox" value="ensemble"> 策略组合</label>
+                <label class="strategy-checkbox-item"><input type="checkbox" value="regime_aware"> 状态感知</label>
+                <label class="strategy-checkbox-item"><input type="checkbox" value="monte_carlo"> 蒙特卡洛</label>
+            </div>
+            <button class="btn btn-secondary" onclick="runCompare()" id="compareBtn">▶ 对比策略</button>
+        </div>
+    </div>
+
+    <!-- 回测结果 -->
+    <div id="resultPanel" class="card" style="display:none;">
+        <div class="section-title">回测结果</div>
+        <div class="metrics-grid" id="metricsGrid"></div>
+        <div class="chart-container" id="chartContainer"></div>
+
+        <!-- 调仓记录 -->
+        <div style="margin-top:20px;">
+            <div class="section-title">
+                调仓记录
+                <span class="trades-count-badge" id="tradesCountBadge">0</span>
+            </div>
+            <div id="tradesTableContainer">
+                <div class="empty-state">运行回测后查看调仓记录</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 策略对比结果 -->
+    <div id="compareResultPanel" class="card" style="display:none;">
+        <div class="section-title">策略对比结果</div>
+        <div id="compareTableContainer"></div>
+        <div class="chart-container" id="compareChartContainer"></div>
+    </div>
+
+    <!-- 日志 -->
+    <div class="card" style="padding:12px;">
+        <div class="log-box" id="logBox">
+            <div class="log-entry">系统就绪，请配置参数后运行回测...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+// ============== 策略配置 ==============
+const STRATEGY_CONFIG = {
+    trend_following: {
+        name: '趋势跟踪',
+        desc: `<strong>趋势跟踪策略</strong>：核心理念是"让利润奔跑，及时止损"。策略通过分析多个时间周期的均线排列（短期/中期/长期均线）、动量指标和ADX趋势强度，判断当前市场是处于上升趋势还是下降趋势，顺势开仓。
+<br>• <strong>适用场景</strong>：单边行情、大趋势明确时表现优秀
+<br>• <strong>风险</strong>：震荡市会频繁被止损，胜率相对较低但盈亏比高
+<br>• <strong>关键参数</strong>：短/中/长期均线窗口决定趋势判断灵敏度`,
+        params: `
+        <div class="params-box" id="stratParamsBox">
+            <div class="section-title">趋势跟踪参数</div>
+            <div class="param-row"><label>短期均线窗口（天）</label><input type="number" id="p_short_window" value="7" min="3" max="30"></div>
+            <div class="param-row"><label>中期均线窗口（天）</label><input type="number" id="p_medium_window" value="30" min="10" max="90"></div>
+            <div class="param-row"><label>长期均线窗口（天）</label><input type="number" id="p_long_window" value="90" min="30" max="200"></div>
+            <div class="param-row"><label>波动率回看期（天）</label><input type="number" id="p_volatility_lookback" value="30" min="10" max="60"></div>
+        </div>`
+    },
+    mean_reversion: {
+        name: '均值回归',
+        desc: `<strong>均值回归策略</strong>：核心理念是"价格会回归均值"。当价格过度偏离均值（超买或超卖）时，预期价格会回归到正常水平。使用RSI、布林带和Z-Score三重指标综合判断超买超卖状态。
+<br>• <strong>适用场景</strong>：震荡市、价格在区间内波动时表现优秀
+<br>• <strong>风险</strong>：强趋势行情下会被套，需要配合趋势过滤
+<br>• <strong>关键参数</strong>：RSI超买超卖阈值和布林带倍数决定信号灵敏度`,
+        params: `
+        <div class="params-box" id="stratParamsBox">
+            <div class="section-title">均值回归参数</div>
+            <div class="param-row"><label>RSI周期（天）</label><input type="number" id="p_rsi_period" value="14" min="5" max="30"></div>
+            <div class="param-row"><label>RSI超买阈值</label><input type="number" id="p_rsi_overbought" value="70" min="60" max="90"><span class="param-hint">高于此值视为超买</span></div>
+            <div class="param-row"><label>RSI超卖阈值</label><input type="number" id="p_rsi_oversold" value="30" min="10" max="40"><span class="param-hint">低于此值视为超卖</span></div>
+            <div class="param-row"><label>布林带周期（天）</label><input type="number" id="p_bb_period" value="20" min="10" max="60"></div>
+            <div class="param-row"><label>布林带标准差倍数</label><input type="number" id="p_bb_std" value="2.0" min="1.0" max="3.0" step="0.1"><span class="param-hint">倍数越大，触发越少</span></div>
+            <div class="param-row"><label>Z-Score回看期（天）</label><input type="number" id="p_lookback" value="30" min="10" max="60"></div>
+        </div>`
+    },
+    monte_carlo: {
+        name: '蒙特卡洛',
+        desc: `<strong>蒙特卡洛模拟策略</strong>：通过大量随机模拟（基于历史收益率分布）生成未来价格路径，统计各种价格情景的概率分布，给出上涨/下跌概率和置信区间。
+<br>• <strong>适用场景</strong>：对价格范围有合理评估，适合风险管理
+<br>• <strong>风险</strong>：基于历史分布，无法预测黑天鹅事件；极端行情下偏差较大
+<br>• <strong>关键参数</strong>：模拟次数越多越精准，但速度越慢`,
+        params: `
+        <div class="params-box" id="stratParamsBox">
+            <div class="section-title">蒙特卡洛参数</div>
+            <div class="param-row"><label>模拟次数</label>
+                <select id="p_n_simulations">
+                    <option value="2000">2000次（快）</option>
+                    <option value="5000" selected>5000次（中）</option>
+                    <option value="10000">10000次（精准）</option>
+                </select>
+            </div>
+            <div class="param-row"><label>启用趋势修正</label><input type="checkbox" id="p_use_trend_adjustment" checked style="width:auto;min-width:0;"><span class="param-hint">根据近期趋势调整模拟参数</span></div>
+        </div>`
+    },
+    ensemble: {
+        name: '策略组合',
+        desc: `<strong>策略组合（Ensemble）</strong>：将趋势跟踪、均值回归、蒙特卡洛三种策略的信号进行加权融合，通过多策略投票降低单一策略的失误率，提升稳定性。
+<br>• <strong>适用场景</strong>：各种市场环境，综合性最强，适合作为基准
+<br>• <strong>风险</strong>：信号融合可能导致信号弱化，错失部分极端行情
+<br>• <strong>关键参数</strong>：投票方式决定如何融合各策略信号`,
+        params: `
+        <div class="params-box" id="stratParamsBox">
+            <div class="section-title">策略组合参数</div>
+            <div class="param-row"><label>投票方式</label>
+                <select id="p_voting_method">
+                    <option value="weighted_average">加权平均</option>
+                    <option value="majority">多数投票</option>
+                    <option value="confidence">置信度加权</option>
+                </select>
+                <span class="param-hint">置信度加权：信号越强权重越高</span>
+            </div>
+        </div>`
+    },
+    regime_aware: {
+        name: '状态感知',
+        desc: `<strong>状态感知策略</strong>：自动检测当前市场是"趋势市"还是"震荡市"（通过ADX指标判断），然后动态切换到最适合的子策略：趋势市用趋势跟踪，震荡市用均值回归。
+<br>• <strong>适用场景</strong>：市场状态经常切换时，自适应能力强
+<br>• <strong>风险</strong>：市场状态判断可能存在滞后，切换时机的误判会影响收益
+<br>• <strong>关键参数</strong>：ADX阈值决定趋势/震荡的判断分界线（通常25为分界）`,
+        params: `
+        <div class="params-box" id="stratParamsBox">
+            <div class="section-title">状态感知参数</div>
+            <div class="param-row"><label>ADX趋势阈值</label><input type="number" id="p_adx_threshold" value="25" min="15" max="50"><span class="param-hint">ADX&gt;阈值时切换到趋势策略</span></div>
+        </div>`
+    }
+};
+
+// ============== 初始化 ==============
+document.getElementById('endDate').value = new Date().toISOString().split('T')[0];
+document.getElementById('compareEndDate').value = new Date().toISOString().split('T')[0];
+onStrategyChange();
+
+function switchTab(tab) {
+    document.querySelectorAll('.tab').forEach((t, i) => {
+        t.classList.toggle('active', (tab === 'single' && i === 0) || (tab === 'compare' && i === 1));
+    });
+    document.getElementById('singleTab').classList.toggle('active', tab === 'single');
+    document.getElementById('compareTab').classList.toggle('active', tab === 'compare');
+}
+
+function onStrategyChange() {
+    const strategy = document.getElementById('strategySelect').value;
+    const config = STRATEGY_CONFIG[strategy];
+    document.getElementById('strategyDesc').innerHTML = config.desc;
+    document.getElementById('strategyParams').innerHTML = config.params;
+}
+
+function log(msg, type = 'info') {
+    const box = document.getElementById('logBox');
+    const el = document.createElement('div');
+    el.className = `log-entry ${type}`;
+    el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    box.insertBefore(el, box.firstChild);
+    while (box.children.length > 80) box.removeChild(box.lastChild);
+}
+
+// 收集策略专属参数
+function collectStrategyParams(strategy) {
+    const p = {};
+    if (strategy === 'trend_following') {
+        p.short_window = parseInt(document.getElementById('p_short_window')?.value || 7);
+        p.medium_window = parseInt(document.getElementById('p_medium_window')?.value || 30);
+        p.long_window = parseInt(document.getElementById('p_long_window')?.value || 90);
+        p.volatility_lookback = parseInt(document.getElementById('p_volatility_lookback')?.value || 30);
+    } else if (strategy === 'mean_reversion') {
+        p.rsi_period = parseInt(document.getElementById('p_rsi_period')?.value || 14);
+        p.rsi_overbought = parseFloat(document.getElementById('p_rsi_overbought')?.value || 70);
+        p.rsi_oversold = parseFloat(document.getElementById('p_rsi_oversold')?.value || 30);
+        p.bb_period = parseInt(document.getElementById('p_bb_period')?.value || 20);
+        p.bb_std = parseFloat(document.getElementById('p_bb_std')?.value || 2.0);
+        p.lookback = parseInt(document.getElementById('p_lookback')?.value || 30);
+    } else if (strategy === 'monte_carlo') {
+        p.n_simulations = parseInt(document.getElementById('p_n_simulations')?.value || 5000);
+        p.use_trend_adjustment = document.getElementById('p_use_trend_adjustment')?.checked ?? true;
+    } else if (strategy === 'ensemble') {
+        p.voting_method = document.getElementById('p_voting_method')?.value || 'weighted_average';
+    } else if (strategy === 'regime_aware') {
+        p.adx_threshold = parseFloat(document.getElementById('p_adx_threshold')?.value || 25);
+    }
+    return p;
+}
+
+// ============== 运行回测 ==============
+async function runBacktest() {
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>运行中...';
+
+    const asset = document.getElementById('assetSelect').value;
+    const strategy = document.getElementById('strategySelect').value;
+    const startDate = document.getElementById('startDate').value;
+    const endDate = document.getElementById('endDate').value;
+    const strategyParams = collectStrategyParams(strategy);
+
+    const params = {
+        strategy,
+        start_date: startDate,
+        end_date: endDate,
+        engine: 'enhanced',
+        enhanced_params: {
+            initial_capital: parseFloat(document.getElementById('initialCapital').value),
+            position_size: parseFloat(document.getElementById('positionSize').value),
+            use_compound: document.getElementById('useCompound').checked,
+            stop_loss_pct: parseFloat(document.getElementById('stopLoss').value),
+            take_profit_pct: parseFloat(document.getElementById('takeProfit').value),
+            trailing_stop_pct: parseFloat(document.getElementById('trailingStop').value),
+            max_position_hold_days: parseInt(document.getElementById('maxHoldDays').value),
+            rebalance_freq: document.getElementById('rebalanceFreq').value
+        },
+        strategy_params: strategyParams
+    };
+
+    log(`开始回测: ${asset} / ${STRATEGY_CONFIG[strategy].name}`);
+
+    try {
+        const resp = await fetch(`/api/backtest/${asset}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+        const result = await resp.json();
+        if (result.error) throw new Error(result.error);
+
+        renderMetrics(result.metrics);
+        renderTrades(result.trades || []);
+        document.getElementById('resultPanel').style.display = 'block';
+        log(`回测完成！总收益 ${result.metrics.trading_return.toFixed(2)}%，交易 ${result.metrics.total_trades} 次`, 'success');
+
+        // 获取图表
+        const chartResp = await fetch(`/api/backtest/${asset}/chart`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+        const chartResult = await chartResp.json();
+        if (chartResult.image) {
+            document.getElementById('chartContainer').innerHTML = `<img src="${chartResult.image}" alt="回测图表">`;
+        }
+    } catch (err) {
+        log(`错误: ${err.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '▶ 运行回测';
+    }
+}
+
+function renderMetrics(m) {
+    const colorClass = v => v >= 0 ? 'positive' : 'negative';
+    const sign = v => v >= 0 ? '+' : '';
+    document.getElementById('metricsGrid').innerHTML = `
+        <div class="metric-card"><h5>策略总收益</h5><div class="metric-value ${colorClass(m.trading_return)}">${sign(m.trading_return)}${m.trading_return.toFixed(2)}%</div></div>
+        <div class="metric-card"><h5>年化收益</h5><div class="metric-value ${colorClass(m.trading_annual_return)}">${sign(m.trading_annual_return)}${m.trading_annual_return.toFixed(2)}%</div></div>
+        <div class="metric-card"><h5>买入持有基准</h5><div class="metric-value ${colorClass(m.buy_hold_return)}">${sign(m.buy_hold_return)}${m.buy_hold_return.toFixed(2)}%</div></div>
+        <div class="metric-card"><h5>超额收益</h5><div class="metric-value ${colorClass(m.excess_return)}">${sign(m.excess_return)}${m.excess_return.toFixed(2)}%</div></div>
+        <div class="metric-card"><h5>夏普比率</h5><div class="metric-value neutral">${m.trading_sharpe.toFixed(2)}</div></div>
+        <div class="metric-card"><h5>最大回撤</h5><div class="metric-value negative">-${Math.abs(m.max_drawdown).toFixed(2)}%</div></div>
+        <div class="metric-card"><h5>胜率</h5><div class="metric-value neutral">${m.win_rate.toFixed(1)}%</div></div>
+        <div class="metric-card"><h5>盈亏比</h5><div class="metric-value neutral">${m.profit_loss_ratio.toFixed(2)}</div></div>
+        <div class="metric-card"><h5>交易次数</h5><div class="metric-value neutral">${m.total_trades}</div></div>
+        <div class="metric-card"><h5>方向准确率</h5><div class="metric-value neutral">${m.direction_accuracy.toFixed(1)}%</div></div>
+    `;
+}
+
+function renderTrades(trades) {
+    const badge = document.getElementById('tradesCountBadge');
+    badge.textContent = trades.length;
+
+    if (!trades.length) {
+        document.getElementById('tradesTableContainer').innerHTML = '<div class="empty-state">无调仓记录</div>';
+        return;
+    }
+
+    let html = `<div style="overflow-x:auto;"><table>
+        <thead><tr>
+            <th>#</th>
+            <th>开仓日期</th>
+            <th>平仓日期</th>
+            <th>方向</th>
+            <th>开仓价格</th>
+            <th>平仓价格</th>
+            <th>盈亏 ($)</th>
+            <th>盈亏 (%)</th>
+            <th>平仓原因</th>
+        </tr></thead><tbody>`;
+
+    trades.forEach((t, i) => {
+        const isLong = t['Position'] === 'Long';
+        const pnl = t['PnL ($)'] || 0;
+        const pnlPct = t['PnL (%)'] || 0;
+        html += `<tr>
+            <td>${i+1}</td>
+            <td>${t['Entry Date'] || '-'}</td>
+            <td>${t['Exit Date'] || '持仓中'}</td>
+            <td><span class="badge ${isLong ? 'badge-long' : 'badge-short'}">${isLong ? '做多' : '做空'}</span></td>
+            <td>$${(t['Entry Price']||0).toLocaleString('en-US', {maximumFractionDigits:2})}</td>
+            <td>${t['Exit Price'] ? '$'+t['Exit Price'].toLocaleString('en-US',{maximumFractionDigits:2}) : '-'}</td>
+            <td><span class="badge ${pnl >= 0 ? 'badge-profit' : 'badge-loss'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</span></td>
+            <td class="${pnlPct >= 0 ? 'positive' : 'negative'}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%</td>
+            <td style="font-size:12px;color:#666;">${t['Exit Reason'] || '-'}</td>
+        </tr>`;
+    });
+
+    html += '</tbody></table></div>';
+    document.getElementById('tradesTableContainer').innerHTML = html;
+}
+
+// ============== 策略对比 ==============
+async function runCompare() {
+    const btn = document.getElementById('compareBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>对比中...';
+
+    const checkboxes = document.querySelectorAll('#compareTab .strategy-checkbox-item input:checked');
+    const strategies = Array.from(checkboxes).map(cb => cb.value);
+
+    if (strategies.length < 2) {
+        log('请至少选择2个策略', 'error');
+        btn.disabled = false;
+        btn.innerHTML = '▶ 对比策略';
+        return;
+    }
+
+    const asset = document.getElementById('compareAsset').value;
+    const startDate = document.getElementById('compareStartDate').value;
+    const endDate = document.getElementById('compareEndDate').value;
+
+    log(`对比策略: ${strategies.join(', ')}`);
+
+    const params = {
+        strategies,
+        start_date: startDate,
+        end_date: endDate,
+        engine: 'enhanced',
+        enhanced_params: { initial_capital: 10000, position_size: 0.8, use_compound: true, stop_loss_pct: 10, take_profit_pct: 20 }
+    };
+
+    try {
+        const resp = await fetch(`/api/backtest/${asset}/compare`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+        const result = await resp.json();
+        if (result.error) throw new Error(result.error);
+
+        renderCompare(result);
+        log('策略对比完成', 'success');
+
+        const chartResp = await fetch(`/api/backtest/${asset}/compare/chart`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+        });
+        const chartResult = await chartResp.json();
+        if (chartResult.image) {
+            document.getElementById('compareChartContainer').innerHTML = `<img src="${chartResult.image}" alt="对比图">`;
+        }
+    } catch (err) {
+        log(`错误: ${err.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '▶ 对比策略';
+    }
+}
+
+function renderCompare(result) {
+    const stratNames = { trend_following: '趋势跟踪', mean_reversion: '均值回归', ensemble: '策略组合', regime_aware: '状态感知', monte_carlo: '蒙特卡洛' };
+    let html = `<div style="overflow-x:auto;"><table class="compare-table">
+        <thead><tr><th>策略</th><th>总收益</th><th>年化收益</th><th>买入持有</th><th>超额收益</th><th>夏普</th><th>最大回撤</th><th>胜率</th><th>交易次数</th></tr></thead><tbody>`;
+
+    result.results.forEach(r => {
+        if (r.error) {
+            html += `<tr><td colspan="9" style="color:#e74c3c;">${r.strategy}: ${r.error}</td></tr>`;
+            return;
+        }
+        const best = r.excess_return > 0;
+        const s = v => v >= 0 ? '+' : '';
+        const c = v => v >= 0 ? 'positive' : 'negative';
+        html += `<tr class="${best ? 'best' : ''}">
+            <td><b>${stratNames[r.strategy] || r.strategy}</b></td>
+            <td class="${c(r.trading_return)}">${s(r.trading_return)}${r.trading_return.toFixed(2)}%</td>
+            <td class="${c(r.trading_annual_return)}">${s(r.trading_annual_return)}${r.trading_annual_return.toFixed(2)}%</td>
+            <td>${s(r.buy_hold_return)}${r.buy_hold_return.toFixed(2)}%</td>
+            <td class="${c(r.excess_return)}"><b>${s(r.excess_return)}${r.excess_return.toFixed(2)}%</b></td>
+            <td>${r.trading_sharpe.toFixed(2)}</td>
+            <td class="negative">${r.max_drawdown.toFixed(2)}%</td>
+            <td>${r.win_rate.toFixed(1)}%</td>
+            <td>${r.total_trades}</td>
+        </tr>`;
+    });
+
+    html += '</tbody></table></div>';
+    document.getElementById('compareTableContainer').innerHTML = html;
+    document.getElementById('compareResultPanel').style.display = 'block';
+}
+</script>
+</body>
+</html>

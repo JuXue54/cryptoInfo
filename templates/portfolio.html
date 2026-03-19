@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>模拟持仓 - 加密货币</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f0f2f5; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); color: white; padding: 20px; text-align: center; }
+        .header h1 { font-size: 26px; margin-bottom: 6px; }
+        .header p { font-size: 14px; opacity: 0.9; }
+        .nav { background: white; padding: 10px 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); display: flex; gap: 20px; align-items: center; }
+        .nav a { color: #11998e; text-decoration: none; font-weight: 600; font-size: 14px; }
+        .nav a:hover { text-decoration: underline; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .layout { display: grid; grid-template-columns: 340px 1fr; gap: 20px; align-items: start; }
+        @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+        .card { background: white; border-radius: 12px; padding: 18px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .section-title { font-size: 15px; font-weight: 700; color: #333; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #11998e; display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+        .section-title span { font-weight: 400; font-size: 12px; color: #999; }
+        .form-group { margin-bottom: 10px; }
+        .form-group label { display: block; font-size: 13px; font-weight: 600; color: #555; margin-bottom: 4px; }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #ddd; font-size: 13px; transition: border 0.2s;
+        }
+        .form-group input:focus, .form-group select:focus { border-color: #11998e; outline: none; }
+        .btn { padding: 8px 16px; border-radius: 6px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .btn-green { background: #11998e; color: white; }
+        .btn-green:hover { background: #0d7e74; }
+        .btn-blue { background: #667eea; color: white; }
+        .btn-blue:hover { background: #5a6fd6; }
+        .btn-red { background: #e53e3e; color: white; }
+        .btn-red:hover { background: #c53030; }
+        .btn-orange { background: #ed8936; color: white; }
+        .btn-orange:hover { background: #dd6b20; }
+        .btn-sm { padding: 4px 10px; font-size: 12px; }
+        .btn:disabled { background: #ccc; cursor: not-allowed; }
+        /* 仓位卡片 */
+        .portfolio-card { border: 1px solid #e8e8e8; border-radius: 10px; padding: 14px; margin-bottom: 10px; cursor: pointer; transition: all 0.2s; position: relative; }
+        .portfolio-card:hover { border-color: #11998e; box-shadow: 0 2px 12px rgba(17,153,142,0.12); }
+        .portfolio-card.active { border-color: #11998e; background: #f0fdf4; box-shadow: 0 2px 12px rgba(17,153,142,0.15); }
+        .portfolio-card .pname { font-size: 14px; font-weight: 700; color: #333; }
+        .portfolio-card .pmeta { font-size: 12px; color: #888; margin-top: 2px; }
+        .portfolio-card .pstats { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+        .portfolio-card .pstat { font-size: 12px; }
+        .portfolio-card .pstat-label { color: #aaa; }
+        .portfolio-card .pstat-value { font-weight: 600; color: #333; }
+        .badge { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+        .badge-manual { background: #e2e8f0; color: #4a5568; }
+        .badge-strategy { background: #bee3f8; color: #2c5282; }
+        .badge-buy { background: #c6f6d5; color: #276749; }
+        .badge-sell { background: #fed7d7; color: #9b2c2c; }
+        .positive { color: #27ae60; }
+        .negative { color: #e74c3c; }
+        .neutral { color: #2980b9; }
+        /* 统计卡片 */
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+        .stat-card { background: linear-gradient(135deg, #f5f7fa, #e8f5e9); border-radius: 8px; padding: 12px; text-align: center; border-left: 3px solid #11998e; }
+        .stat-card h5 { font-size: 11px; color: #777; text-transform: uppercase; margin-bottom: 5px; }
+        .stat-value { font-size: 20px; font-weight: 700; color: #333; }
+        .stat-value.big { font-size: 24px; }
+        /* 交易表格 */
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        table th, table td { padding: 9px 10px; text-align: center; border-bottom: 1px solid #f0f0f0; }
+        table th { background: #f8f9fa; font-weight: 600; color: #555; white-space: nowrap; position: sticky; top: 0; }
+        table tr:hover { background: #fafffe; }
+        .table-wrap { max-height: 360px; overflow-y: auto; border-radius: 6px; border: 1px solid #f0f0f0; }
+        /* 对比面板 */
+        .compare-bar { background: #f0fdf4; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border-left: 4px solid #11998e; }
+        .compare-bar .pct { font-size: 22px; font-weight: 700; }
+        /* 图表 */
+        #equityChart { width: 100%; height: 260px; }
+        .tabs { display: flex; border-bottom: 2px solid #e0e0e0; margin-bottom: 16px; }
+        .tab { padding: 8px 18px; cursor: pointer; border: none; background: transparent; font-size: 13px; font-weight: 600; color: #888; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+        .tab.active { color: #11998e; border-bottom-color: #11998e; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.open { display: flex; }
+        .modal { background: white; border-radius: 12px; padding: 24px; width: 400px; max-width: 96vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+        .modal h3 { font-size: 16px; margin-bottom: 16px; color: #333; }
+        .modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+        .empty-state { text-align: center; padding: 32px; color: #aaa; font-size: 14px; }
+        .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #e0e0e0; border-top: 2px solid #11998e; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 4px; }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+        .trade-form-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 10px; }
+        .trade-form-row .form-group { flex: 1; min-width: 100px; margin-bottom: 0; }
+        .delete-btn { opacity: 0.5; transition: opacity 0.2s; }
+        .delete-btn:hover { opacity: 1; }
+        .info-tip { font-size: 11px; color: #999; margin-top: 4px; }
+    </style>
+</head>
+<body>
+<div class="header">
+    <h1>📊 模拟持仓</h1>
+    <p>创建多个模拟仓位 · 手动或策略调仓 · 对比不同操作策略的收益</p>
+</div>
+<div class="nav">
+    <a href="/">← 返回首页</a>
+    <a href="/backtest_enhanced">📈 策略回测</a>
+</div>
+
+<div class="container">
+    <div class="layout">
+        <!-- 左侧：仓位列表 + 创建 -->
+        <div>
+            <!-- 创建仓位 -->
+            <div class="card">
+                <div class="section-title">新建模拟仓</div>
+                <div class="form-group">
+                    <label>仓位名称</label>
+                    <input type="text" id="newName" placeholder="如：我的BTC手动仓">
+                </div>
+                <div class="form-group">
+                    <label>币种</label>
+                    <select id="newAsset">
+                        <option value="BTC">BTC</option>
+                        <option value="ETH">ETH</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>操作方式</label>
+                    <select id="newMode" onchange="onModeChange()">
+                        <option value="manual">手动调仓</option>
+                        <option value="strategy">跟踪策略（仅记录参考）</option>
+                    </select>
+                </div>
+                <div id="strategySelectGroup" class="form-group" style="display:none;">
+                    <label>参考策略</label>
+                    <select id="newStrategy">
+                        <option value="trend_following">趋势跟踪</option>
+                        <option value="mean_reversion">均值回归</option>
+                        <option value="ensemble">策略组合</option>
+                        <option value="regime_aware">状态感知</option>
+                        <option value="monte_carlo">蒙特卡洛</option>
+                    </select>
+                    <div class="info-tip">策略仓的交易记录需手动录入，策略仅作标注用途</div>
+                </div>
+                <div class="form-group">
+                    <label>初始资金 (USDT)</label>
+                    <input type="number" id="newCapital" value="10000" min="100" step="100">
+                </div>
+                <div class="form-group">
+                    <label>备注</label>
+                    <input type="text" id="newDesc" placeholder="可选">
+                </div>
+                <button class="btn btn-green" onclick="createPortfolio()" style="width:100%;">+ 创建仓位</button>
+            </div>
+
+            <!-- 仓位列表 -->
+            <div class="card">
+                <div class="section-title">
+                    我的模拟仓
+                    <span id="portfolioCount">0 个仓位</span>
+                </div>
+                <div id="portfolioList">
+                    <div class="empty-state">暂无模拟仓，请先创建</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧：仓位详情 -->
+        <div id="detailPanel">
+            <div class="card">
+                <div class="empty-state" style="padding:60px;">
+                    <div style="font-size:48px;margin-bottom:12px;">📊</div>
+                    <div>请在左侧选择一个模拟仓位查看详情</div>
+                </div>
+            </div>
+
+            <!-- 对比面板（始终显示） -->
+            <div class="card" id="comparePanel" style="display:none;">
+                <div class="section-title">仓位收益对比</div>
+                <div id="compareList"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 添加交易弹窗 -->
+<div class="modal-overlay" id="tradeModal">
+    <div class="modal">
+        <h3 id="tradeModalTitle">添加交易记录</h3>
+        <div class="form-group">
+            <label>交易日期</label>
+            <input type="date" id="tradeDate">
+        </div>
+        <div class="form-group">
+            <label>交易方向</label>
+            <select id="tradeType">
+                <option value="buy">买入</option>
+                <option value="sell">卖出</option>
+            </select>
+        </div>
+        <div class="trade-form-row">
+            <div class="form-group">
+                <label>成交价格 (USDT)</label>
+                <input type="number" id="tradePrice" placeholder="如 65000" min="0" step="0.01">
+            </div>
+            <div class="form-group">
+                <label>数量</label>
+                <input type="number" id="tradeQty" placeholder="如 0.1" min="0" step="0.0001">
+            </div>
+        </div>
+        <div class="trade-form-row">
+            <div class="form-group">
+                <label>手续费 (USDT)</label>
+                <input type="number" id="tradeFee" value="0" min="0" step="0.01">
+            </div>
+            <div class="form-group">
+                <label>成交金额</label>
+                <input type="text" id="tradeAmount" readonly placeholder="自动计算" style="background:#f5f5f5;">
+            </div>
+        </div>
+        <div class="form-group">
+            <label>备注</label>
+            <input type="text" id="tradeNote" placeholder="可选">
+        </div>
+        <div class="modal-footer">
+            <button class="btn" onclick="closeModal()" style="background:#f0f0f0;color:#333;">取消</button>
+            <button class="btn btn-green" onclick="submitTrade()">确认添加</button>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentPortfolioId = null;
+let allPortfolios = [];
+
+// 初始化
+document.getElementById('tradeDate').value = new Date().toISOString().split('T')[0];
+document.getElementById('tradePrice').addEventListener('input', calcAmount);
+document.getElementById('tradeQty').addEventListener('input', calcAmount);
+loadPortfolios();
+
+function calcAmount() {
+    const p = parseFloat(document.getElementById('tradePrice').value) || 0;
+    const q = parseFloat(document.getElementById('tradeQty').value) || 0;
+    document.getElementById('tradeAmount').value = (p * q).toFixed(2);
+}
+
+function onModeChange() {
+    const mode = document.getElementById('newMode').value;
+    document.getElementById('strategySelectGroup').style.display = mode === 'strategy' ? 'block' : 'none';
+}
+
+async function loadPortfolios() {
+    try {
+        const resp = await fetch('/api/portfolios');
+        allPortfolios = await resp.json();
+        renderPortfolioList();
+        renderCompare();
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+function renderPortfolioList() {
+    const container = document.getElementById('portfolioList');
+    document.getElementById('portfolioCount').textContent = `${allPortfolios.length} 个仓位`;
+
+    if (!allPortfolios.length) {
+        container.innerHTML = '<div class="empty-state">暂无模拟仓，请先创建</div>';
+        return;
+    }
+
+    const stratNames = { trend_following:'趋势跟踪', mean_reversion:'均值回归', ensemble:'策略组合', regime_aware:'状态感知', monte_carlo:'蒙特卡洛' };
+
+    container.innerHTML = allPortfolios.map(p => {
+        const ret = p.total_return_pct || 0;
+        const retClass = ret >= 0 ? 'positive' : 'negative';
+        const modeLabel = p.mode === 'manual' ? '手动' : `策略:${stratNames[p.strategy] || p.strategy || ''}`;
+        return `
+        <div class="portfolio-card ${currentPortfolioId === p.portfolio_id ? 'active' : ''}" onclick="selectPortfolio(${p.portfolio_id})">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div>
+                    <div class="pname">${p.name}</div>
+                    <div class="pmeta">${p.asset_code} · <span class="badge ${p.mode === 'manual' ? 'badge-manual' : 'badge-strategy'}">${modeLabel}</span></div>
+                </div>
+                <div style="text-align:right;">
+                    <div class="${retClass}" style="font-size:18px;font-weight:700;">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</div>
+                    <div style="font-size:11px;color:#aaa;">总收益率</div>
+                </div>
+            </div>
+            <div class="pstats">
+                <div class="pstat"><span class="pstat-label">初始:</span> <span class="pstat-value">$${(p.initial_capital||0).toLocaleString()}</span></div>
+                <div class="pstat"><span class="pstat-label">市值:</span> <span class="pstat-value">$${(p.market_value||0).toLocaleString()}</span></div>
+                <div class="pstat"><span class="pstat-label">持仓:</span> <span class="pstat-value">${(p.current_qty||0).toFixed(4)} ${p.asset_code}</span></div>
+                <div class="pstat"><span class="pstat-label">交易:</span> <span class="pstat-value">${p.total_trades||0}次</span></div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function selectPortfolio(id) {
+    currentPortfolioId = id;
+    renderPortfolioList();  // 更新选中状态
+    await loadPortfolioDetail(id);
+}
+
+async function loadPortfolioDetail(id) {
+    try {
+        const resp = await fetch(`/api/portfolios/${id}`);
+        const data = await resp.json();
+        if (data.error) { alert(data.error); return; }
+        renderDetail(data);
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+function renderDetail(data) {
+    const stratNames = { trend_following:'趋势跟踪', mean_reversion:'均值回归', ensemble:'策略组合', regime_aware:'状态感知', monte_carlo:'蒙特卡洛' };
+    const ret = data.total_return_pct || 0;
+    const retClass = ret >= 0 ? 'positive' : 'negative';
+    const unrealClass = (data.unrealized_pnl||0) >= 0 ? 'positive' : 'negative';
+    const realClass = (data.realized_pnl||0) >= 0 ? 'positive' : 'negative';
+    const modeName = data.mode === 'manual' ? '手动调仓' : `策略跟踪 (${stratNames[data.strategy] || data.strategy || ''})`;
+
+    let html = `
+    <div class="card">
+        <div class="section-title">
+            ${data.name}
+            <div style="display:flex;gap:6px;">
+                <button class="btn btn-green btn-sm" onclick="openTradeModal(${data.portfolio_id})">+ 添加交易</button>
+                <button class="btn btn-red btn-sm" onclick="deletePortfolio(${data.portfolio_id})">删除仓位</button>
+            </div>
+        </div>
+        <div style="font-size:13px;color:#888;margin-bottom:14px;">${data.asset_code} · ${modeName} · 初始资金 $${(data.initial_capital||0).toLocaleString()}</div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h5>总收益率</h5>
+                <div class="stat-value big ${retClass}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</div>
+            </div>
+            <div class="stat-card">
+                <h5>总盈亏</h5>
+                <div class="stat-value ${ret >= 0 ? 'positive' : 'negative'}">${(data.total_pnl||0) >= 0 ? '+' : ''}$${(data.total_pnl||0).toFixed(2)}</div>
+            </div>
+            <div class="stat-card">
+                <h5>浮动盈亏</h5>
+                <div class="stat-value ${unrealClass}">${(data.unrealized_pnl||0) >= 0 ? '+' : ''}$${(data.unrealized_pnl||0).toFixed(2)}</div>
+            </div>
+            <div class="stat-card">
+                <h5>已实现盈亏</h5>
+                <div class="stat-value ${realClass}">${(data.realized_pnl||0) >= 0 ? '+' : ''}$${(data.realized_pnl||0).toFixed(2)}</div>
+            </div>
+            <div class="stat-card">
+                <h5>当前持仓</h5>
+                <div class="stat-value neutral">${(data.current_qty||0).toFixed(4)}</div>
+            </div>
+            <div class="stat-card">
+                <h5>平均成本</h5>
+                <div class="stat-value neutral">$${(data.avg_cost||0).toLocaleString('en',{maximumFractionDigits:2})}</div>
+            </div>
+            <div class="stat-card">
+                <h5>当前价格</h5>
+                <div class="stat-value neutral">$${(data.current_price||0).toLocaleString('en',{maximumFractionDigits:2})}</div>
+            </div>
+            <div class="stat-card">
+                <h5>市值</h5>
+                <div class="stat-value neutral">$${(data.market_value||0).toLocaleString('en',{maximumFractionDigits:2})}</div>
+            </div>
+            <div class="stat-card">
+                <h5>手续费合计</h5>
+                <div class="stat-value negative">-$${(data.total_fees||0).toFixed(2)}</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchDetailTab('trades')">交易记录 (${(data.trades||[]).length})</div>
+            <div class="tab" onclick="switchDetailTab('curve')">权益曲线</div>
+        </div>
+
+        <div id="tradesTab" class="tab-content active">`;
+
+    const trades = data.trades || [];
+    if (!trades.length) {
+        html += '<div class="empty-state">暂无交易记录，点击"添加交易"录入</div>';
+    } else {
+        html += `<div class="table-wrap"><table>
+            <thead><tr><th>#</th><th>日期</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th><th>手续费</th><th>备注</th><th>删除</th></tr></thead>
+            <tbody>`;
+        trades.forEach((t, i) => {
+            const isBuy = t.trade_type === 'buy';
+            html += `<tr>
+                <td>${i+1}</td>
+                <td>${t.trade_date}</td>
+                <td><span class="badge ${isBuy ? 'badge-buy' : 'badge-sell'}">${isBuy ? '买入' : '卖出'}</span></td>
+                <td>$${parseFloat(t.price).toLocaleString('en',{maximumFractionDigits:2})}</td>
+                <td>${parseFloat(t.quantity).toFixed(6)}</td>
+                <td>$${parseFloat(t.amount).toFixed(2)}</td>
+                <td>$${parseFloat(t.fee).toFixed(2)}</td>
+                <td style="font-size:12px;color:#999;">${t.note||'-'}</td>
+                <td><button class="btn btn-red btn-sm delete-btn" onclick="deleteTrade(${t.id},${data.portfolio_id})">×</button></td>
+            </tr>`;
+        });
+        html += '</tbody></table></div>';
+    }
+
+    html += `</div>
+        <div id="curveTab" class="tab-content">
+            <div id="equityChartContainer">
+                <div class="empty-state">
+                    <button class="btn btn-blue" onclick="loadEquityCurve(${data.portfolio_id})">加载权益曲线</button>
+                </div>
+            </div>
+        </div>
+    </div>`;
+
+    document.getElementById('detailPanel').innerHTML = html;
+}
+
+function switchDetailTab(tab) {
+    document.querySelectorAll('#detailPanel .tab').forEach((t, i) => {
+        t.classList.toggle('active', (tab === 'trades' && i === 0) || (tab === 'curve' && i === 1));
+    });
+    document.getElementById('tradesTab').classList.toggle('active', tab === 'trades');
+    document.getElementById('curveTab').classList.toggle('active', tab === 'curve');
+}
+
+async function loadEquityCurve(portfolioId) {
+    document.getElementById('equityChartContainer').innerHTML = '<div class="empty-state"><span class="spinner"></span>加载中...</div>';
+    try {
+        const resp = await fetch(`/api/portfolios/${portfolioId}/equity_curve`);
+        const data = await resp.json();
+        renderEquityCurve(data.curve, data.portfolio);
+    } catch (e) {
+        document.getElementById('equityChartContainer').innerHTML = '<div class="empty-state">加载失败</div>';
+    }
+}
+
+function renderEquityCurve(curve, portfolio) {
+    if (!curve || !curve.length) {
+        document.getElementById('equityChartContainer').innerHTML = '<div class="empty-state">数据不足，请先添加交易记录</div>';
+        return;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.id = 'equityChart';
+    canvas.style.width = '100%';
+    canvas.style.height = '260px';
+    document.getElementById('equityChartContainer').innerHTML = '';
+    document.getElementById('equityChartContainer').appendChild(canvas);
+
+    // 使用SVG内联图表（不依赖外部库）
+    const equities = curve.map(c => c.equity);
+    const dates = curve.map(c => c.date);
+    const minE = Math.min(...equities);
+    const maxE = Math.max(...equities);
+    const range = maxE - minE || 1;
+    const W = 800, H = 220, PAD = 40;
+
+    const pts = equities.map((e, i) => {
+        const x = PAD + (i / (equities.length - 1)) * (W - PAD * 2);
+        const y = H - PAD - ((e - minE) / range) * (H - PAD * 2);
+        return `${x},${y}`;
+    }).join(' ');
+
+    const initLine = PAD + ((portfolio.initial_capital - minE) / range) * (H - PAD * 2);
+    const initY = H - initLine;
+    const lastVal = equities[equities.length - 1];
+    const lastRet = ((lastVal - portfolio.initial_capital) / portfolio.initial_capital * 100).toFixed(2);
+    const color = lastVal >= portfolio.initial_capital ? '#27ae60' : '#e74c3c';
+
+    // 日期标签（取5个）
+    const labelCount = 5;
+    let labels = '';
+    for (let i = 0; i < labelCount; i++) {
+        const idx = Math.floor(i * (curve.length - 1) / (labelCount - 1));
+        const x = PAD + (idx / (equities.length - 1)) * (W - PAD * 2);
+        labels += `<text x="${x}" y="${H - 8}" font-size="10" fill="#aaa" text-anchor="middle">${dates[idx].slice(5)}</text>`;
+    }
+
+    // Y轴标签
+    let ylabels = '';
+    for (let i = 0; i <= 4; i++) {
+        const val = minE + (range * i / 4);
+        const y = H - PAD - (i / 4) * (H - PAD * 2);
+        ylabels += `<text x="${PAD - 4}" y="${y + 4}" font-size="9" fill="#bbb" text-anchor="end">$${val.toFixed(0)}</text>`;
+        ylabels += `<line x1="${PAD}" y1="${y}" x2="${W - PAD}" y2="${y}" stroke="#f0f0f0" stroke-width="1"/>`;
+    }
+
+    const svg = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:260px;font-family:sans-serif;">
+        ${ylabels}
+        <line x1="${PAD}" y1="${initY}" x2="${W-PAD}" y2="${initY}" stroke="#ddd" stroke-width="1" stroke-dasharray="4,3"/>
+        <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2.5"/>
+        <circle cx="${PAD + ((equities.length-1)/(equities.length-1))*(W-PAD*2)}" cy="${H-PAD-((lastVal-minE)/range)*(H-PAD*2)}" r="4" fill="${color}"/>
+        ${labels}
+        <text x="${W/2}" y="16" font-size="12" fill="#666" text-anchor="middle">${portfolio.name} 权益曲线 (收益率: ${lastRet >= 0 ? '+' : ''}${lastRet}%)</text>
+    </svg>`;
+
+    document.getElementById('equityChartContainer').innerHTML = svg;
+}
+
+function renderCompare() {
+    if (allPortfolios.length < 2) {
+        document.getElementById('comparePanel').style.display = 'none';
+        return;
+    }
+    document.getElementById('comparePanel').style.display = 'block';
+
+    const sorted = [...allPortfolios].sort((a, b) => (b.total_return_pct || 0) - (a.total_return_pct || 0));
+    const maxRet = Math.max(...sorted.map(p => Math.abs(p.total_return_pct || 0))) || 1;
+
+    document.getElementById('compareList').innerHTML = sorted.map((p, i) => {
+        const ret = p.total_return_pct || 0;
+        const retClass = ret >= 0 ? 'positive' : 'negative';
+        const barW = Math.abs(ret) / maxRet * 60;
+        const stratNames = { trend_following:'趋势跟踪', mean_reversion:'均值回归', ensemble:'策略组合', regime_aware:'状态感知', monte_carlo:'蒙特卡洛' };
+        const modeName = p.mode === 'manual' ? '手动' : (stratNames[p.strategy] || p.strategy || '策略');
+        return `
+        <div class="compare-bar" style="cursor:pointer;" onclick="selectPortfolio(${p.portfolio_id})">
+            <div>
+                <div style="font-weight:700;font-size:14px;">${i+1}. ${p.name}</div>
+                <div style="font-size:12px;color:#aaa;">${p.asset_code} · ${modeName} · ${p.total_trades||0}次交易</div>
+                <div style="margin-top:6px;height:6px;background:#e0f7f4;border-radius:3px;width:200px;overflow:hidden;">
+                    <div style="height:100%;background:${ret>=0?'#27ae60':'#e74c3c'};width:${barW}%;border-radius:3px;"></div>
+                </div>
+            </div>
+            <div style="text-align:right;">
+                <div class="pct ${retClass}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</div>
+                <div style="font-size:11px;color:#aaa;">总盈亏: ${(p.total_pnl||0) >= 0 ? '+' : ''}$${(p.total_pnl||0).toFixed(2)}</div>
+                <div style="font-size:11px;color:#aaa;">市值: $${(p.market_value||0).toLocaleString()}</div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ============== 创建仓位 ==============
+async function createPortfolio() {
+    const name = document.getElementById('newName').value.trim();
+    const asset = document.getElementById('newAsset').value;
+    const mode = document.getElementById('newMode').value;
+    const strategy = mode === 'strategy' ? document.getElementById('newStrategy').value : null;
+    const capital = parseFloat(document.getElementById('newCapital').value);
+    const desc = document.getElementById('newDesc').value.trim();
+
+    if (!name) { alert('请输入仓位名称'); return; }
+
+    try {
+        const resp = await fetch('/api/portfolios', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, asset_code: asset, mode, strategy, initial_capital: capital, description: desc })
+        });
+        const result = await resp.json();
+        if (result.error) { alert(result.error); return; }
+        document.getElementById('newName').value = '';
+        document.getElementById('newDesc').value = '';
+        await loadPortfolios();
+    } catch (e) {
+        alert('创建失败: ' + e.message);
+    }
+}
+
+// ============== 删除仓位 ==============
+async function deletePortfolio(id) {
+    if (!confirm('确定删除该仓位及所有交易记录？此操作不可撤销。')) return;
+    try {
+        await fetch(`/api/portfolios/${id}`, { method: 'DELETE' });
+        currentPortfolioId = null;
+        document.getElementById('detailPanel').innerHTML = `<div class="card"><div class="empty-state" style="padding:60px;"><div style="font-size:48px;margin-bottom:12px;">📊</div><div>请在左侧选择一个模拟仓位查看详情</div></div></div>`;
+        await loadPortfolios();
+    } catch (e) {
+        alert('删除失败');
+    }
+}
+
+// ============== 交易弹窗 ==============
+function openTradeModal(portfolioId) {
+    currentPortfolioId = portfolioId;
+    document.getElementById('tradeDate').value = new Date().toISOString().split('T')[0];
+    document.getElementById('tradeType').value = 'buy';
+    document.getElementById('tradePrice').value = '';
+    document.getElementById('tradeQty').value = '';
+    document.getElementById('tradeFee').value = '0';
+    document.getElementById('tradeAmount').value = '';
+    document.getElementById('tradeNote').value = '';
+    document.getElementById('tradeModal').classList.add('open');
+}
+
+function closeModal() {
+    document.getElementById('tradeModal').classList.remove('open');
+}
+
+async function submitTrade() {
+    const price = parseFloat(document.getElementById('tradePrice').value);
+    const qty = parseFloat(document.getElementById('tradeQty').value);
+    if (!price || !qty) { alert('请输入价格和数量'); return; }
+
+    const body = {
+        trade_date: document.getElementById('tradeDate').value,
+        trade_type: document.getElementById('tradeType').value,
+        price,
+        quantity: qty,
+        fee: parseFloat(document.getElementById('tradeFee').value) || 0,
+        note: document.getElementById('tradeNote').value.trim()
+    };
+
+    try {
+        const resp = await fetch(`/api/portfolios/${currentPortfolioId}/trades`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const result = await resp.json();
+        if (result.error) { alert(result.error); return; }
+        closeModal();
+        await loadPortfolios();
+        await loadPortfolioDetail(currentPortfolioId);
+    } catch (e) {
+        alert('添加失败: ' + e.message);
+    }
+}
+
+// ============== 删除交易 ==============
+async function deleteTrade(tradeId, portfolioId) {
+    if (!confirm('确定删除这条交易记录？')) return;
+    try {
+        await fetch(`/api/portfolios/${portfolioId}/trades/${tradeId}`, { method: 'DELETE' });
+        await loadPortfolios();
+        await loadPortfolioDetail(portfolioId);
+    } catch (e) {
+        alert('删除失败');
+    }
+}
+
+// 点击弹窗外关闭
+document.getElementById('tradeModal').addEventListener('click', function(e) {
+    if (e.target === this) closeModal();
+});
+</script>
+</body>
+</html>

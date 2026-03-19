@@ -7,6 +7,7 @@
 2. 将数据存储在SQLite数据库中
 3. 支持自动增量更新
 4. 绘制K线图（日K、周K、月K），支持均线和对数坐标轴
+5. BTC价格走势预测（蒙特卡洛模拟）
 
 使用方法:
     python main.py update              # 更新数据
@@ -16,6 +17,8 @@
     python main.py chart BTC --log     # 使用对数坐标轴
     python main.py chart BTC --ma 20 60 # 显示20日和60日均线
     python main.py info                # 查看数据概览
+    python main.py predict             # BTC走势预测
+    python main.py predict --days 14   # 预测未来14天
 """
 import argparse
 import sys
@@ -170,6 +173,41 @@ def plot_chart(asset_code: str,
     print(f"图表已保存到: {save_path}")
 
 
+def predict_btc(days: int = 7, simulations: int = 10000, save_path: str = None, no_chart: bool = False):
+    """
+    BTC价格预测
+
+    Args:
+        days: 预测天数
+        simulations: 蒙特卡洛模拟次数
+        save_path: 图表保存路径
+        no_chart: 是否不生成图表
+    """
+    from src.btc_predictor import BTCPredictor, print_prediction_report
+    from src.prediction_chart import plot_prediction
+
+    print(f"\n正在进行BTC价格预测（未来{days}天）...")
+    print(f"使用 {simulations} 次蒙特卡洛模拟\n")
+
+    try:
+        predictor = BTCPredictor(forecast_days=days, n_simulations=simulations)
+        result = predictor.predict(use_trend=True)
+
+        # 打印报告
+        print_prediction_report(result)
+
+        # 绘制图表
+        if not no_chart:
+            if save_path is None:
+                save_path = f"btc_prediction_{days}d.png"
+            plot_prediction(result, save_path=save_path, show=False)
+
+    except Exception as e:
+        print(f"预测失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="加密货币价格追踪工具",
@@ -194,6 +232,12 @@ def main():
 
   # 查看信息
   python main.py info                   # 查看数据概览
+
+  # BTC走势预测
+  python main.py predict                # 预测未来7天
+  python main.py predict --days 14      # 预测未来14天
+  python main.py predict --days 7 --simulations 5000  # 使用5000次模拟
+  python main.py predict --save pred.png --no-chart   # 保存图表
         """
     )
 
@@ -224,6 +268,17 @@ def main():
     import_parser.add_argument('file', help='CSV文件路径')
     import_parser.add_argument('asset', help='币种代码 (BTC/ETH)')
     import_parser.add_argument('--date-format', help='日期格式，如 %%Y-%%m-%%d')
+
+    # predict 命令
+    predict_parser = subparsers.add_parser('predict', help='BTC价格走势预测')
+    predict_parser.add_argument('--days', type=int, default=7,
+                               help='预测天数，默认7天')
+    predict_parser.add_argument('--simulations', type=int, default=10000,
+                               help='蒙特卡洛模拟次数，默认10000次')
+    predict_parser.add_argument('--save', dest='save_path',
+                               help='保存预测图表路径')
+    predict_parser.add_argument('--no-chart', action='store_true',
+                               help='不生成图表')
 
     args = parser.parse_args()
 
@@ -256,6 +311,14 @@ def main():
 
     elif args.command == 'import':
         import_csv_data(args.file, args.asset, args.date_format)
+
+    elif args.command == 'predict':
+        predict_btc(
+            days=args.days,
+            simulations=args.simulations,
+            save_path=args.save_path,
+            no_chart=args.no_chart
+        )
 
     else:
         parser.print_help()

@@ -38,6 +38,44 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_prices_asset_date
                 ON prices(asset_code, currency_code, date)
             """)
+
+            # ======= 模拟持仓表 =======
+            # 模拟仓位主表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS portfolios (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    asset_code TEXT NOT NULL DEFAULT 'BTC',
+                    mode TEXT NOT NULL DEFAULT 'manual',
+                    strategy TEXT,
+                    initial_capital REAL NOT NULL DEFAULT 10000,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # 交易记录表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS portfolio_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    portfolio_id INTEGER NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    trade_type TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    amount REAL NOT NULL,
+                    fee REAL NOT NULL DEFAULT 0,
+                    note TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_portfolio_trades_pid
+                ON portfolio_trades(portfolio_id, trade_date)
+            """)
             conn.commit()
 
     def save_price_data(self, asset_code: str, currency_code: str,
@@ -173,3 +211,158 @@ class Database:
                 'min_price': result[3],
                 'max_price': result[4]
             }
+
+    # ============== 模拟持仓操作 ==============
+
+    def create_portfolio(self, name: str, asset_code: str, mode: str,
+                         initial_capital: float, strategy: str = None,
+                         description: str = None) -> int:
+        """创建模拟仓位，返回仓位ID"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO portfolios (name, asset_code, mode, strategy, initial_capital, description)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (name, asset_code.upper(), mode, strategy, initial_capital, description))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_all_portfolios(self) -> List[Dict]:
+        """获取所有模拟仓位"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM portfolios ORDER BY created_at DESC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_portfolio(self, portfolio_id: int) -> Optional[Dict]:
+        """获取单个仓位信息"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_portfolio(self, portfolio_id: int):
+        """删除仓位及所有交易记录"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM portfolio_trades WHERE portfolio_id = ?", (portfolio_id,))
+            cursor.execute("DELETE FROM portfolios WHERE id = ?", (portfolio_id,))
+            conn.commit()
+
+    def add_trade(self, portfolio_id: int, trade_date: str, trade_type: str,
+                  price: float, quantity: float, fee: float = 0,
+                  note: str = None) -> int:
+        """添加交易记录（buy/sell），返回记录ID"""
+        amount = price * quantity
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO portfolio_trades (portfolio_id, trade_date, trade_type, price, quantity, amount, fee, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (portfolio_id, trade_date, trade_type, price, quantity, amount, fee, note))
+            # 更新持仓更新时间
+            cursor.execute("UPDATE portfolios SET updated_at = ? WHERE id = ?",
+                           (datetime.now().isoformat(), portfolio_id))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_trades(self, portfolio_id: int) -> List[Dict]:
+        """获取仓位的所有交易记录"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM portfolio_trades
+                WHERE portfolio_id = ?
+                ORDER BY trade_date ASC, id ASC
+            """, (portfolio_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def delete_trade(self, trade_id: int):
+        """删除单条交易记录"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM portfolio_trades WHERE id = ?", (trade_id,))
+            conn.commit()
+
+    def calculate_portfolio_stats(self, portfolio_id: int, current_price: float) -> Dict:
+        """
+        计算仓位统计信息：持仓量、平均成本、浮盈亏、已实现盈亏、总收益率
+        使用先进先出（FIFO）计算已实现盈亏
+        """
+        portfolio = self.get_portfolio(portfolio_id)
+        if not portfolio:
+            return {}
+
+        trades = self.get_trades(portfolio_id)
+        initial_capital = portfolio['initial_capital']
+
+        # FIFO队列计算
+        buy_queue = []  # [(price, qty), ...]
+        realized_pnl = 0.0
+        total_bought_amount = 0.0
+        total_sold_amount = 0.0
+        total_bought_qty = 0.0
+        total_sold_qty = 0.0
+        total_fees = 0.0
+
+        for t in trades:
+            qty = float(t['quantity'])
+            price = float(t['price'])
+            fee = float(t['fee'])
+            total_fees += fee
+
+            if t['trade_type'] == 'buy':
+                buy_queue.append({'price': price, 'qty': qty})
+                total_bought_amount += price * qty
+                total_bought_qty += qty
+            elif t['trade_type'] == 'sell':
+                remaining_sell = qty
+                total_sold_amount += price * qty
+                total_sold_qty += qty
+                while remaining_sell > 0 and buy_queue:
+                    head = buy_queue[0]
+                    if head['qty'] <= remaining_sell:
+                        realized_pnl += (price - head['price']) * head['qty']
+                        remaining_sell -= head['qty']
+                        buy_queue.pop(0)
+                    else:
+                        realized_pnl += (price - head['price']) * remaining_sell
+                        head['qty'] -= remaining_sell
+                        remaining_sell = 0
+
+        # 当前持仓
+        current_qty = sum(b['qty'] for b in buy_queue)
+        if current_qty > 0:
+            avg_cost = sum(b['price'] * b['qty'] for b in buy_queue) / current_qty
+        else:
+            avg_cost = 0.0
+
+        unrealized_pnl = (current_price - avg_cost) * current_qty if current_qty > 0 else 0.0
+        total_pnl = realized_pnl + unrealized_pnl - total_fees
+        total_return_pct = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0.0
+        market_value = current_price * current_qty
+
+        return {
+            'portfolio_id': portfolio_id,
+            'name': portfolio['name'],
+            'asset_code': portfolio['asset_code'],
+            'mode': portfolio['mode'],
+            'strategy': portfolio['strategy'],
+            'initial_capital': initial_capital,
+            'current_qty': round(current_qty, 8),
+            'avg_cost': round(avg_cost, 2),
+            'market_value': round(market_value, 2),
+            'current_price': current_price,
+            'unrealized_pnl': round(unrealized_pnl, 2),
+            'realized_pnl': round(realized_pnl, 2),
+            'total_fees': round(total_fees, 2),
+            'total_pnl': round(total_pnl, 2),
+            'total_return_pct': round(total_return_pct, 4),
+            'total_bought_qty': round(total_bought_qty, 8),
+            'total_sold_qty': round(total_sold_qty, 8),
+            'total_trades': len(trades),
+        }
