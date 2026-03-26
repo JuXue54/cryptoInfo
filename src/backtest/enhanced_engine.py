@@ -51,7 +51,7 @@ class EnhancedBacktestEngine:
         self.trades: List[Trade] = []
         self.equity_curve: List[float] = []
         self.dates: List[datetime] = []
-
+        self.position_history: List[Dict] = []  # 新增：仓位历史记录
     def run_backtest(self,
                      df: pd.DataFrame,
                      start_date: Optional[str] = None,
@@ -115,10 +115,12 @@ class EnhancedBacktestEngine:
         position_entry_date = None
         highest_price_since_entry = 0
         lowest_price_since_entry = float('inf')
+        realized_pnl = 0  # 累计已实现盈亏
 
         self.equity_curve = [capital]
         self.dates = [df.index[0]]
         self.trades = []
+        self.position_history = []  # 重置仓位历史
 
         predictions = []
         current_trade = None
@@ -127,6 +129,21 @@ class EnhancedBacktestEngine:
         rebalance_dates = self._generate_rebalance_dates(df, rebalance_freq)
 
         total_steps = len(df)
+        current_signal_strength = 0  # 当前信号强度
+
+        # 记录初始状态
+        self._record_position_state(
+            date=df.index[0],
+            current_position=Position.FLAT,
+            current_price=df['close_price'].iloc[0],
+            entry_price=0,
+            capital=capital,
+            unrealized_pnl=0,
+            realized_pnl=realized_pnl,
+            position_size=0,
+            signal_strength=0,
+            reason="Initial State"
+        )
 
         for i, (date, row) in enumerate(df.iterrows()):
             current_price = row['close_price']
@@ -202,6 +219,7 @@ class EnhancedBacktestEngine:
                         pnl_pct = -pnl_pct
 
                     capital += pnl
+                    realized_pnl += pnl  # 累计已实现盈亏
 
                     current_trade.exit_date = date
                     current_trade.exit_price = current_price
@@ -209,6 +227,20 @@ class EnhancedBacktestEngine:
                     current_trade.pnl_pct = pnl_pct
                     current_trade.exit_reason = exit_reason
                     self.trades.append(current_trade)
+
+                    # 记录仓位变化
+                    self._record_position_state(
+                        date=date,
+                        current_position=current_position,
+                        current_price=current_price,
+                        entry_price=position_entry_price,
+                        capital=capital,
+                        unrealized_pnl=0,
+                        realized_pnl=realized_pnl,
+                        position_size=0,
+                        signal_strength=current_signal_strength,
+                        reason=f"Exit: {exit_reason}"
+                    )
 
                     current_position = Position.FLAT
                     current_trade = None
@@ -226,7 +258,7 @@ class EnhancedBacktestEngine:
                     )
 
                     up_prob = result.up_probability
-                    signal_strength = abs(up_prob - 50) / 50  # 0-1
+                    current_signal_strength = abs(up_prob - 50) / 50  # 0-1
 
                     # 确定目标仓位
                     if up_prob > 60:
@@ -250,6 +282,7 @@ class EnhancedBacktestEngine:
                                 pnl_pct = -pnl_pct
 
                             capital += pnl
+                            realized_pnl += pnl
 
                             current_trade.exit_date = date
                             current_trade.exit_price = exit_price
@@ -258,12 +291,26 @@ class EnhancedBacktestEngine:
                             current_trade.exit_reason = "Signal Change"
                             self.trades.append(current_trade)
 
+                            # 记录平仓状态
+                            self._record_position_state(
+                                date=date,
+                                current_position=current_position,
+                                current_price=current_price,
+                                entry_price=position_entry_price,
+                                capital=capital,
+                                unrealized_pnl=0,
+                                realized_pnl=realized_pnl,
+                                position_size=0,
+                                signal_strength=current_signal_strength,
+                                reason="Exit: Signal Change"
+                            )
+
                         # 开新仓位
                         if target_position != Position.FLAT:
                             actual_position_size = position_size
                             if strategy_params and strategy_params.get('use_position_sizing'):
                                 # 根据信号强度调整仓位
-                                actual_position_size = position_size * (0.3 + signal_strength * 0.7)
+                                actual_position_size = position_size * (0.3 + current_signal_strength * 0.7)
 
                             trade_size = capital * actual_position_size
 
@@ -283,6 +330,20 @@ class EnhancedBacktestEngine:
                             position_entry_date = date
                             highest_price_since_entry = current_price
                             lowest_price_since_entry = current_price
+
+                            # 记录开仓状态
+                            self._record_position_state(
+                                date=date,
+                                current_position=target_position,
+                                current_price=current_price,
+                                entry_price=current_price,
+                                capital=capital - trade_size,
+                                unrealized_pnl=0,
+                                realized_pnl=realized_pnl,
+                                position_size=actual_position_size,
+                                signal_strength=current_signal_strength,
+                                reason=f"Entry: Signal ({up_prob:.1f}% up)"
+                            )
 
                         current_position = target_position
 
@@ -313,6 +374,26 @@ class EnhancedBacktestEngine:
             self.equity_curve.append(total_equity)
             self.dates.append(date)
 
+            # 记录每日仓位状态（只在再平衡日或有持仓时记录，避免数据过大）
+            if should_rebalance or current_position != Position.FLAT:
+                # 计算当前仓位比例
+                current_position_size = 0
+                if current_position != Position.FLAT and current_trade:
+                    current_position_size = current_trade.size / total_equity if total_equity > 0 else 0
+
+                self._record_position_state(
+                    date=date,
+                    current_position=current_position,
+                    current_price=current_price,
+                    entry_price=position_entry_price,
+                    capital=capital,
+                    unrealized_pnl=unrealized_pnl,
+                    realized_pnl=realized_pnl,
+                    position_size=current_position_size,
+                    signal_strength=current_signal_strength,
+                    reason="Daily Update" if should_rebalance else "Position Holding"
+                )
+
             if progress_callback:
                 progress_callback((i + 1) / total_steps * 100)
 
@@ -334,6 +415,21 @@ class EnhancedBacktestEngine:
             current_trade.exit_reason = "End of Backtest"
             self.trades.append(current_trade)
 
+            # 记录最终平仓状态
+            realized_pnl += pnl
+            self._record_position_state(
+                date=df.index[-1],
+                current_position=current_position,
+                current_price=final_price,
+                entry_price=position_entry_price,
+                capital=capital + pnl,
+                unrealized_pnl=0,
+                realized_pnl=realized_pnl,
+                position_size=0,
+                signal_strength=current_signal_strength,
+                reason="Exit: End of Backtest"
+            )
+
         # 计算最终收益
         final_capital = self.equity_curve[-1]
         total_return = (final_capital - initial_capital) / initial_capital * 100
@@ -351,7 +447,9 @@ class EnhancedBacktestEngine:
             'forecast_days': 1,
             'total_predictions': len(predictions),
             **metrics,
-            'predictions': predictions
+            'predictions': predictions,
+            'position_history': self.position_history,
+            'trades': self.trades
         }
 
         return BacktestResult(**result_data)
@@ -383,6 +481,48 @@ class EnhancedBacktestEngine:
         elif position == Position.SHORT:
             return size * (entry_price - exit_price) / entry_price
         return 0
+
+    def _record_position_state(self,
+                               date: datetime,
+                               current_position: Position,
+                               current_price: float,
+                               entry_price: float,
+                               capital: float,
+                               unrealized_pnl: float,
+                               realized_pnl: float,
+                               position_size: float,
+                               signal_strength: float,
+                               reason: str):
+        """
+        记录仓位历史状态
+
+        Args:
+            date: 日期
+            current_position: 当前持仓方向
+            current_price: 当前价格
+            entry_price: 入场价格
+            capital: 现金
+            unrealized_pnl: 浮动盈亏
+            realized_pnl: 已实现盈亏
+            position_size: 仓位比例 (0-1)
+            signal_strength: 信号强度 (0-1)
+            reason: 记录原因
+        """
+        total_equity = capital + unrealized_pnl
+
+        self.position_history.append({
+            'date': date,
+            'position': current_position.name if current_position != Position.FLAT else 'FLAT',
+            'position_size': position_size if current_position != Position.FLAT else 0,
+            'entry_price': entry_price if current_position != Position.FLAT else 0,
+            'current_price': current_price,
+            'unrealized_pnl': unrealized_pnl,
+            'realized_pnl': realized_pnl,
+            'total_equity': total_equity,
+            'cash': capital,
+            'signal_strength': signal_strength,
+            'reason': reason
+        })
 
     def _calculate_enhanced_metrics(self, initial_capital: float,
                                     final_capital: float,
@@ -469,14 +609,13 @@ class EnhancedBacktestEngine:
         data = []
         for t in self.trades:
             data.append({
-                'Entry Date': t.entry_date.strftime('%Y-%m-%d'),
-                'Exit Date': t.exit_date.strftime('%Y-%m-%d') if t.exit_date else None,
-                'Position': 'Long' if t.position == Position.LONG else 'Short',
-                'Entry Price': t.entry_price,
-                'Exit Price': t.exit_price,
-                'PnL ($)': t.pnl,
-                'PnL (%)': t.pnl_pct,
-                'Exit Reason': t.exit_reason
+                'entry_date': t.entry_date.strftime('%Y-%m-%d'),
+                'exit_date': t.exit_date.strftime('%Y-%m-%d') if t.exit_date else t.entry_date.strftime('%Y-%m-%d'),
+                'direction': 'LONG' if t.position == Position.LONG else 'SHORT',
+                'entry_price': t.entry_price,
+                'exit_price': t.exit_price if t.exit_price is not None else t.entry_price,
+                'pnl': (t.pnl_pct if t.pnl_pct is not None else 0),
+                'exit_reason': t.exit_reason or ''
             })
 
         return pd.DataFrame(data)

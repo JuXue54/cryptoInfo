@@ -14,6 +14,21 @@ from src.database import Database
 from src.data_fetcher import DataFetcher
 from src.aggregator import DataAggregator
 
+# 初始化 Anthropic 客户端（如果配置了 API Key）
+anthropic_client = None
+if os.environ.get('ANTHROPIC_API_KEY'):
+    try:
+        import anthropic
+        client_kwargs = {'api_key': os.environ.get('ANTHROPIC_API_KEY')}
+        if os.environ.get('ANTHROPIC_BASE_URL'):
+            client_kwargs['base_url'] = os.environ.get('ANTHROPIC_BASE_URL')
+        anthropic_client = anthropic.Anthropic(**client_kwargs)
+    except ImportError:
+
+
+
+        print("Warning: anthropic SDK not installed, Claude analysis will be unavailable")
+
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
@@ -27,13 +42,6 @@ def index():
     """主页 - 返回前端HTML"""
     return render_template_string(HTML_TEMPLATE)
 
-
-@app.route('/backtest_enhanced')
-def backtest_enhanced_page():
-    """增强回测页面"""
-    with open('templates/backtest_enhanced.html', 'r', encoding='utf-8') as f:
-        content = f.read()
-    return render_template_string(content)
 
 @app.route('/api/assets')
 def get_assets():
@@ -51,6 +59,19 @@ def get_assets():
             'max_price': summary['max_price']
         })
     return jsonify(assets)
+
+
+@app.route('/api/config')
+def get_config():
+    """获取后端配置信息（用于诊断）"""
+    return jsonify({
+        'anthropic_available': anthropic_client is not None,
+        'anthropic_api_key_set': bool(os.environ.get('ANTHROPIC_API_KEY')),
+        'anthropic_base_url_set': bool(os.environ.get('ANTHROPIC_BASE_URL')),
+        'supported_assets': list(SUPPORTED_ASSETS.keys()),
+        'default_currency': DEFAULT_CURRENCY
+    })
+
 
 @app.route('/api/data/<asset_code>')
 def get_data(asset_code):
@@ -314,6 +335,7 @@ def predict_asset_chart(asset_code):
 def convert_to_native(obj):
     """将 numpy 类型转换为 Python 原生类型，用于 JSON 序列化"""
     import numpy as np
+    from datetime import datetime
 
     if isinstance(obj, np.bool_):
         return bool(obj)
@@ -323,6 +345,10 @@ def convert_to_native(obj):
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif hasattr(obj, 'isoformat'):  # pandas Timestamp
+        return obj.isoformat()
     elif isinstance(obj, dict):
         return {k: convert_to_native(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -336,7 +362,8 @@ def create_strategy(strategy_name: str, params: dict):
     """创建策略实例"""
     from src.strategies import (
         MonteCarloStrategy, TrendFollowingStrategy,
-        MeanReversionStrategy, EnsembleStrategy, RegimeAwareStrategy
+        MeanReversionStrategy, EnsembleStrategy, RegimeAwareStrategy,
+        LSTMStrategy
     )
 
     if strategy_name == 'monte_carlo':
@@ -371,6 +398,12 @@ def create_strategy(strategy_name: str, params: dict):
             trend_strategy=TrendFollowingStrategy(),
             range_strategy=MeanReversionStrategy(),
             adx_threshold=params.get('adx_threshold', 25)
+        )
+    elif strategy_name == 'lstm':
+        return LSTMStrategy(
+            seq_len=params.get('seq_len', 60),
+            hidden_size=params.get('hidden_size', 128),
+            num_layers=params.get('num_layers', 2)
         )
     else:
         raise ValueError(f'Unknown strategy: {strategy_name}')
@@ -458,6 +491,7 @@ def backtest_asset(asset_code):
 
         # 构建响应
         response = {
+            'asset': asset_code,
             'strategy': result.strategy_name,
             'engine': engine_type,
             'start_date': result.start_date,
@@ -496,7 +530,8 @@ def backtest_asset(asset_code):
                 'excess_annual_return': float(result.trading_annual_return - result.buy_hold_annual_return)
             },
             'predictions': convert_to_native(result.predictions[:100]),
-            'trades': trades_data[:50]  # 限制返回数量
+            'trades': trades_data[:50],  # 限制返回数量
+            'position_history': convert_to_native(result.position_history[:500]) if result.position_history else []
         }
 
         return jsonify(response)
@@ -743,6 +778,181 @@ def backtest_compare_chart(asset_code):
         return jsonify({
             'image': f'data:image/png;base64,{image_base64}',
             'strategies': [r.strategy_name for r in backtest_results]
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/backtest/<asset_code>/analyze', methods=['POST'])
+def analyze_backtest(asset_code):
+    """使用 Claude AI 分析回测结果，找出策略表现不如买入持有的原因"""
+    asset_code = asset_code.upper()
+    if asset_code not in SUPPORTED_ASSETS:
+        return jsonify({'error': 'Unsupported asset'}), 400
+
+    # 检查 Anthropic 客户端是否可用
+    if anthropic_client is None:
+        return jsonify({
+            'error': 'Claude analysis not available. Please set ANTHROPIC_API_KEY environment variable.'
+        }), 503
+
+    try:
+        data = request.get_json() or {}
+
+        # 获取请求参数
+        strategy_name = data.get('strategy', 'unknown')
+        strategy_params = data.get('strategy_params', {})
+        metrics = data.get('metrics', {})
+        trades = data.get('trades', [])
+        position_history = data.get('position_history', [])
+        buy_hold_return = data.get('buy_hold_return', 0)
+        strategy_return = data.get('strategy_return', 0)
+        start_date = data.get('start_date', '')
+        end_date = data.get('end_date', '')
+
+        # 构建策略描述
+        strategy_descriptions = {
+            'monte_carlo': '蒙特卡洛模拟策略 - 基于历史波动率进行随机模拟预测',
+            'trend_following': '趋势跟踪策略 - 使用多时间框架移动平均线识别趋势',
+            'mean_reversion': '均值回归策略 - 基于RSI和布林带识别超买超卖',
+            'ensemble': '策略组合 - 综合多个策略的预测结果',
+            'regime_aware': '状态感知策略 - 根据市场状态自动切换策略'
+        }
+        strategy_desc = strategy_descriptions.get(strategy_name, strategy_name)
+
+        # 计算交易统计
+        winning_trades = [t for t in trades if t.get('pnl', 0) > 0]
+        losing_trades = [t for t in trades if t.get('pnl', 0) <= 0]
+        avg_win = sum(t.get('pnl', 0) for t in winning_trades) / len(winning_trades) if winning_trades else 0
+        avg_loss = sum(t.get('pnl', 0) for t in losing_trades) / len(losing_trades) if losing_trades else 0
+
+        # 计算持仓时间统计
+        hold_times = []
+        for t in trades:
+            entry_date = t.get('entry_date', '')
+            exit_date = t.get('exit_date', '')
+            if entry_date and exit_date:
+                try:
+                    from datetime import datetime
+                    entry = datetime.strptime(entry_date, '%Y-%m-%d')
+                    exit = datetime.strptime(exit_date, '%Y-%m-%d')
+                    hold_times.append((exit - entry).days)
+                except:
+                    pass
+        avg_hold_time = sum(hold_times) / len(hold_times) if hold_times else 0
+
+        # 识别关键调仓时机（大额盈亏）
+        significant_trades = sorted(trades, key=lambda x: abs(x.get('pnl', 0)), reverse=True)[:5]
+
+        # 构建 prompt
+        prompt = f"""你是一个专业的量化交易策略分析师。请分析以下策略回测结果，找出策略表现不如买入持有的原因，并给出改进建议。
+
+## 回测基本信息
+- 资产: {asset_code}
+- 回测期间: {start_date} 至 {end_date}
+- 策略: {strategy_desc}
+- 策略参数: {json.dumps(strategy_params, ensure_ascii=False)}
+
+## 收益对比
+- 策略总收益率: {strategy_return:.2f}%
+- 买入持有总收益率: {buy_hold_return:.2f}%
+- 收益差距: {strategy_return - buy_hold_return:.2f}% (策略落后)
+
+## 策略交易统计
+- 总交易次数: {len(trades)}
+- 胜率: {metrics.get('win_rate', 0):.2f}%
+- 盈亏比: {metrics.get('profit_loss_ratio', 0):.2f}
+- 平均盈利: {avg_win:.2f}%
+- 平均亏损: {avg_loss:.2f}%
+- 最大回撤: {metrics.get('max_drawdown', 0):.2f}%
+- 平均持仓时间: {avg_hold_time:.1f} 天
+
+## 风险指标
+- 策略夏普比率: {metrics.get('trading_sharpe', 0):.2f}
+- 买入持有夏普比率: {metrics.get('buy_hold_sharpe', 0):.2f}
+- 年化波动率: {metrics.get('annual_volatility', 0):.2f}%
+
+## 重要交易记录（按盈亏绝对值排序）
+"""
+        for i, t in enumerate(significant_trades, 1):
+            prompt += f"""
+{i}. {t.get('entry_date', 'N/A')} 开仓 -> {t.get('exit_date', 'N/A')} 平仓
+   - 方向: {t.get('direction', 'N/A')}
+   - 入场价: ${t.get('entry_price', 0):,.2f} -> 出场价: ${t.get('exit_price', 0):,.2f}
+   - 盈亏: {t.get('pnl', 0):+.2f}% ({t.get('exit_reason', 'N/A')})
+"""
+
+        prompt += f"""
+## 分析要求
+请从以下几个方面进行分析：
+1. **错失机会分析**: 策略在哪些时期空仓或轻仓，错过了主要上涨行情？
+2. **错误信号分析**: 策略在哪些时期错误地开仓或持仓，导致亏损？
+3. **止损止盈分析**: 止损止盈设置是否过早或过晚？移动止损是否有效？
+4. **持仓时间分析**: 平均持仓时间是否合理？是否过早获利了结或过久持有亏损？
+5. **波动率适应**: 策略是否适应了市场的波动率变化？
+
+请用中文回复，格式如下：
+- analysis: 详细的原因分析（200-400字）
+- key_findings: 关键发现列表（3-5条）
+- improvement_suggestions: 改进建议列表（3-5条）
+"""
+
+        # 调用 Claude API
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        # 解析响应
+        analysis_text = response.content[0].text if response.content else ""
+
+        # 提取关键发现和建议（简单的文本解析）
+        key_findings = []
+        improvement_suggestions = []
+
+        # 尝试从响应中提取列表
+        lines = analysis_text.split('\n')
+        current_section = None
+
+        for line in lines:
+            line = line.strip()
+            if '关键发现' in line or 'key_findings' in line.lower():
+                current_section = 'findings'
+                continue
+            elif '改进建议' in line or 'improvement' in line.lower():
+                current_section = 'suggestions'
+                continue
+            elif line.startswith('analysis:') or line.startswith('分析：'):
+                continue
+
+            if line.startswith('-') or line.startswith('*') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
+                item = line.lstrip('-*0123456789. ')
+                if current_section == 'findings' and item:
+                    key_findings.append(item)
+                elif current_section == 'suggestions' and item:
+                    improvement_suggestions.append(item)
+
+        # 如果没有提取到，使用默认提取逻辑
+        if not key_findings:
+            # 尝试提取任何看起来是列表项的内容
+            for line in lines:
+                line = line.strip()
+                if (line.startswith('-') or line.startswith('*')) and len(line) > 10:
+                    key_findings.append(line.lstrip('-* '))
+                if len(key_findings) >= 5:
+                    break
+
+        return jsonify({
+            'analysis': analysis_text,
+            'key_findings': key_findings[:5] if key_findings else ['未能自动提取关键发现'],
+            'improvement_suggestions': improvement_suggestions[:5] if improvement_suggestions else ['未能自动提取改进建议'],
+            'strategy': strategy_name,
+            'asset': asset_code
         })
 
     except Exception as e:
@@ -1071,7 +1281,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>加密货币价格追踪工具</title>
+    <title>加密货币分析工具</title>
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         * {
@@ -1082,34 +1292,159 @@ HTML_TEMPLATE = '''
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #f5f5f5;
+            background: #f0f2f5;
             min-height: 100vh;
         }
 
-        .header {
+        /* 应用容器 */
+        .app-container {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* 侧边栏 */
+        .sidebar {
+            width: 220px;
+            background: linear-gradient(180deg, #1a1f36 0%, #2d3561 100%);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            position: fixed;
+            height: 100vh;
+            left: 0;
+            top: 0;
+            z-index: 1000;
+            transition: transform 0.3s ease;
+        }
+
+        .sidebar-header {
+            padding: 24px 20px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .sidebar-header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .sidebar-header p {
+            font-size: 12px;
+            opacity: 0.7;
+        }
+
+        .sidebar-nav {
+            flex: 1;
+            padding: 16px 12px;
+            overflow-y: auto;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            margin-bottom: 4px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            color: rgba(255,255,255,0.8);
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .nav-item:hover {
+            background: rgba(255,255,255,0.1);
+            color: white;
+        }
+
+        .nav-item.active {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
+        }
+
+        .nav-icon {
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+        }
+
+        .sidebar-footer {
+            padding: 16px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            font-size: 12px;
+            opacity: 0.6;
             text-align: center;
         }
 
-        .header h1 {
-            font-size: 28px;
-            margin-bottom: 10px;
+        /* 移动端菜单按钮 */
+        .menu-toggle {
+            display: none;
+            position: fixed;
+            top: 16px;
+            left: 16px;
+            z-index: 1001;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 18px;
         }
 
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
+        /* 主内容区 */
+        .main-content {
+            flex: 1;
+            margin-left: 220px;
+            padding: 24px;
+            min-height: 100vh;
+        }
+
+        /* 面板容器 */
+        .panel {
+            display: none;
+        }
+
+        .panel.active {
+            display: block;
+        }
+
+        .panel-header {
+            margin-bottom: 24px;
+        }
+
+        .panel-header h2 {
+            font-size: 24px;
+            font-weight: 600;
+            color: #1a1f36;
+            margin-bottom: 8px;
+        }
+
+        .panel-header p {
+            color: #666;
+            font-size: 14px;
+        }
+
+        /* 卡片样式 */
+        .card {
+            background: white;
+            border-radius: 12px;
             padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
         }
 
+        /* 控制面板 */
         .control-panel {
             background: white;
             border-radius: 12px;
             padding: 20px;
             margin-bottom: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
         }
 
         .control-row {
@@ -1118,6 +1453,10 @@ HTML_TEMPLATE = '''
             gap: 20px;
             align-items: center;
             margin-bottom: 15px;
+        }
+
+        .control-row:last-child {
+            margin-bottom: 0;
         }
 
         .control-group {
@@ -1168,6 +1507,82 @@ HTML_TEMPLATE = '''
             transform: none;
         }
 
+        button.secondary {
+            background: #6c757d;
+        }
+
+        button.secondary:hover {
+            background: #5a6268;
+        }
+
+        button.success {
+            background: #28a745;
+        }
+
+        button.success:hover {
+            background: #218838;
+        }
+
+        button.danger {
+            background: #dc3545;
+        }
+
+        button.danger:hover {
+            background: #c82333;
+        }
+
+        /* 按钮组 */
+        .btn-group {
+            display: flex;
+            gap: 5px;
+        }
+
+        .btn-group button {
+            padding: 8px 16px;
+        }
+
+        /* 图表容器 */
+        .chart-container {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            position: relative;
+        }
+
+        #chart {
+            width: 100%;
+            height: 500px;
+        }
+
+        /* 信息网格 */
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-top: 20px;
+        }
+
+        .info-item {
+            padding: 16px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+
+        .info-item h4 {
+            color: #666;
+            font-size: 12px;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .info-item p {
+            color: #333;
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        /* 均线选项 */
         .ma-options {
             display: flex;
             flex-wrap: wrap;
@@ -1180,10 +1595,11 @@ HTML_TEMPLATE = '''
             align-items: center;
             gap: 5px;
             cursor: pointer;
-            padding: 5px 10px;
+            padding: 6px 12px;
             background: #f0f0f0;
             border-radius: 4px;
             transition: all 0.3s;
+            font-size: 13px;
         }
 
         .ma-checkbox:hover {
@@ -1192,6 +1608,8 @@ HTML_TEMPLATE = '''
 
         .ma-checkbox input {
             cursor: pointer;
+            width: 16px;
+            height: 16px;
         }
 
         .ma-checkbox.checked {
@@ -1199,104 +1617,11 @@ HTML_TEMPLATE = '''
             color: white;
         }
 
-        .chart-container {
-            background: white;
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            position: relative;
-        }
-
-        #chart {
-            width: 100%;
-            height: 600px;
-        }
-
-        .info-panel {
-            background: white;
-            border-radius: 12px;
-            padding: 20px;
-            margin-top: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        }
-
-        .info-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-        }
-
-        .info-item {
-            padding: 15px;
-            background: #f8f9fa;
-            border-radius: 8px;
-        }
-
-        .info-item h4 {
-            color: #666;
-            font-size: 12px;
-            margin-bottom: 5px;
-            text-transform: uppercase;
-        }
-
-        /* 预测和回测相关样式 */
-        .tabs {
-            display: flex;
-            gap: 5px;
-            margin-bottom: 20px;
-            border-bottom: 2px solid #e0e0e0;
-        }
-
-        .tab {
-            padding: 12px 24px;
-            cursor: pointer;
-            border: none;
-            background: transparent;
-            color: #666;
-            font-weight: 600;
-            transition: all 0.3s;
-            border-bottom: 2px solid transparent;
-            margin-bottom: -2px;
-        }
-
-        .tab:hover {
-            color: #667eea;
-        }
-
-        .tab.active {
-            color: #667eea;
-            border-bottom-color: #667eea;
-        }
-
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        .prediction-panel {
-            background: white;
-            border-radius: 12px;
-            padding: 20px;
-            margin-top: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        }
-
-        .prediction-controls {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 15px;
-            margin-bottom: 20px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid #eee;
-        }
-
+        /* 预测结果卡片 */
         .prediction-result {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
+            gap: 16px;
             margin-bottom: 20px;
         }
 
@@ -1332,24 +1657,19 @@ HTML_TEMPLATE = '''
             background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
         }
 
-        .prediction-chart {
-            width: 100%;
-            max-height: 600px;
-            border-radius: 8px;
-            margin-top: 20px;
-        }
-
+        /* 回测指标 */
         .backtest-metrics {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
             margin-bottom: 20px;
         }
 
         .metric-card {
             background: #f8f9fa;
             border-radius: 8px;
-            padding: 15px;
+            padding: 16px;
+            border-left: 4px solid #667eea;
         }
 
         .metric-card h5 {
@@ -1372,6 +1692,7 @@ HTML_TEMPLATE = '''
             color: #e74c3c;
         }
 
+        /* 进度条 */
         .progress-bar {
             width: 100%;
             height: 8px;
@@ -1387,26 +1708,19 @@ HTML_TEMPLATE = '''
             transition: width 0.3s ease;
         }
 
-        .info-item p {
-            color: #333;
-            font-size: 18px;
-            font-weight: 600;
-        }
-
+        /* 加载动画 */
         .loading {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            font-size: 18px;
-            color: #667eea;
             display: none;
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
         }
 
         .loading.show {
             display: block;
         }
 
+        /* 日志容器 */
         .log-container {
             background: #1e1e1e;
             color: #00ff00;
@@ -1433,27 +1747,6 @@ HTML_TEMPLATE = '''
             color: #00ff88;
         }
 
-        .btn-group {
-            display: flex;
-            gap: 5px;
-        }
-
-        .btn-group button {
-            padding: 8px 16px;
-        }
-
-        .tooltip {
-            position: absolute;
-            background: rgba(0, 0, 0, 0.8);
-            color: white;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 12px;
-            pointer-events: none;
-            z-index: 1000;
-            display: none;
-        }
-
         /* 滑块样式 */
         input[type="range"] {
             -webkit-appearance: none;
@@ -1475,169 +1768,575 @@ HTML_TEMPLATE = '''
             box-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
 
-        input[type="range"]::-moz-range-thumb {
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: #667eea;
-            cursor: pointer;
-            border: none;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        /* 表格样式 */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
         }
 
-        input[type="checkbox"] {
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #333;
+        }
+
+        tr:hover {
+            background: #f8f9fa;
+        }
+
+        /* 响应式布局 */
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-100%);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+                padding: 16px;
+                padding-top: 60px;
+            }
+
+            .menu-toggle {
+                display: block;
+            }
+
+            #chart {
+                height: 350px;
+            }
+
+            .control-row {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .control-group {
+                justify-content: space-between;
+            }
+        }
+
+        /* 预测图表 */
+        .prediction-chart {
+            width: 100%;
+            max-height: 500px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+
+        /* 仓位管理样式 */
+        .portfolio-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .portfolio-item {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 16px;
             cursor: pointer;
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+
+        .portfolio-item:hover {
+            background: #e9ecef;
+        }
+
+        .portfolio-item.active {
+            border-color: #667eea;
+            background: #f0f4ff;
+        }
+
+        .portfolio-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .portfolio-name {
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        .portfolio-asset {
+            background: #667eea;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .portfolio-stats {
+            display: flex;
+            gap: 16px;
+            font-size: 13px;
+            color: #666;
+        }
+
+        .portfolio-return {
+            font-weight: 600;
+        }
+
+        .portfolio-return.positive {
+            color: #27ae60;
+        }
+
+        .portfolio-return.negative {
+            color: #e74c3c;
+        }
+
+        /* 模态框 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal.show {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            width: 90%;
+            max-width: 500px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h3 {
+            font-size: 20px;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #666;
+            padding: 0;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-close:hover {
+            background: #f0f0f0;
+            border-radius: 50%;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 10px 12px;
+        }
+
+        .form-actions {
+            display: flex;
+            gap: 12px;
+            justify-content: flex-end;
+            margin-top: 24px;
+        }
+
+        /* 两栏布局 */
+        .two-column {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+        }
+
+        @media (max-width: 992px) {
+            .two-column {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* 交易记录 */
+        .trade-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .trade-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+        }
+
+        .trade-item.buy {
+            border-left: 3px solid #27ae60;
+        }
+
+        .trade-item.sell {
+            border-left: 3px solid #e74c3c;
+        }
+
+        .trade-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .trade-date {
+            font-size: 12px;
+            color: #666;
+        }
+
+        .trade-type {
+            font-weight: 600;
+        }
+
+        .trade-type.buy {
+            color: #27ae60;
+        }
+
+        .trade-type.sell {
+            color: #e74c3c;
+        }
+
+        /* 权益曲线 */
+        .equity-chart {
+            width: 100%;
+            height: 300px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+        }
+
+        /* 调仓记录样式 */
+        .position-timeline {
+            margin-top: 20px;
+        }
+
+        .timeline-item {
+            display: flex;
+            gap: 16px;
+            padding: 16px;
+            border-left: 3px solid #667eea;
+            margin-left: 16px;
+            position: relative;
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -9px;
+            top: 20px;
+            width: 14px;
+            height: 14px;
+            background: #667eea;
+            border-radius: 50%;
+        }
+
+        .timeline-date {
+            font-size: 12px;
+            color: #666;
+            min-width: 80px;
+        }
+
+        .timeline-content {
+            flex: 1;
+        }
+
+        .timeline-action {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .timeline-reason {
+            font-size: 13px;
+            color: #666;
+        }
+
+        .timeline-pnl {
+            text-align: right;
+        }
+
+        .timeline-pnl.positive {
+            color: #27ae60;
+        }
+
+        .timeline-pnl.negative {
+            color: #e74c3c;
+        }
+
+        /* 分析面板 */
+        .analysis-panel {
+            background: linear-gradient(135deg, #f5f7fa 0%, #e4e8ec 100%);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        .analysis-panel h4 {
+            margin-bottom: 12px;
+            color: #333;
+        }
+
+        .analysis-content {
+            line-height: 1.8;
+            color: #555;
+        }
+
+        .finding-list, .suggestion-list {
+            margin: 12px 0;
+            padding-left: 20px;
+        }
+
+        .finding-list li, .suggestion-list li {
+            margin-bottom: 8px;
+            line-height: 1.6;
+        }
+
+        /* 空状态 */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .empty-state h3 {
+            font-size: 18px;
+            margin-bottom: 8px;
+            color: #333;
+        }
+
+        .empty-state p {
+            font-size: 14px;
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>加密货币价格追踪工具</h1>
-        <p>支持日K/周K/月K，多均线，对数坐标</p>
-    </div>
+    <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
 
-    <div class="container">
-        <!-- 控制面板 -->
-        <div class="control-panel">
-            <div class="control-row">
-                <div class="control-group">
-                    <label>币种:</label>
-                    <select id="assetSelect">
-                        <option value="BTC">Bitcoin (BTC)</option>
-                        <option value="ETH">Ethereum (ETH)</option>
-                    </select>
+    <div class="app-container">
+        <!-- 侧边栏 -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <h1>加密货币分析</h1>
+                <p>智能交易决策助手</p>
+            </div>
+
+            <nav class="sidebar-nav">
+                <div class="nav-item active" onclick="switchPanel('market')">
+                    <span class="nav-icon">📊</span>
+                    <span>市场数据</span>
+                </div>
+                <div class="nav-item" onclick="switchPanel('prediction')">
+                    <span class="nav-icon">🔮</span>
+                    <span>价格预测</span>
+                </div>
+                <div class="nav-item" onclick="switchPanel('backtest')">
+                    <span class="nav-icon">📈</span>
+                    <span>策略回测</span>
+                </div>
+                <div class="nav-item" onclick="switchPanel('portfolio')">
+                    <span class="nav-icon">💼</span>
+                    <span>仓位管理</span>
+                </div>
+            </nav>
+
+            <div class="sidebar-footer">
+                Crypto Analysis Tool v1.0
+            </div>
+        </aside>
+
+        <!-- 主内容区 -->
+        <main class="main-content">
+            <!-- ========== 市场数据面板 ========== -->
+            <div id="marketPanel" class="panel active">
+                <div class="panel-header">
+                    <h2>市场数据</h2>
+                    <p>实时价格走势与技术分析</p>
                 </div>
 
-                <div class="control-group">
-                    <label>时间周期:</label>
-                    <div class="btn-group">
-                        <button id="btnDay" class="active" onclick="setTimeframe('day')">日K</button>
-                        <button id="btnWeek" onclick="setTimeframe('week')">周K</button>
-                        <button id="btnMonth" onclick="setTimeframe('month')">月K</button>
+                <div class="control-panel">
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>币种:</label>
+                            <select id="assetSelect">
+                                <option value="BTC">Bitcoin (BTC)</option>
+                                <option value="ETH">Ethereum (ETH)</option>
+                            </select>
+                        </div>
+
+                        <div class="control-group">
+                            <label>时间周期:</label>
+                            <div class="btn-group">
+                                <button id="btnDay" class="active" onclick="setTimeframe('day')">日K</button>
+                                <button id="btnWeek" onclick="setTimeframe('week')">周K</button>
+                                <button id="btnMonth" onclick="setTimeframe('month')">月K</button>
+                            </div>
+                        </div>
+
+                        <div class="control-group">
+                            <label>坐标轴:</label>
+                            <div class="btn-group">
+                                <button id="btnLinear" class="active" onclick="setScale('linear')">普通</button>
+                                <button id="btnLog" onclick="setScale('log')">对数</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>均线:</label>
+                            <div class="ma-options">
+                                <label class="ma-checkbox" id="ma5"><input type="checkbox" value="5"> MA5</label>
+                                <label class="ma-checkbox checked" id="ma10"><input type="checkbox" value="10" checked> MA10</label>
+                                <label class="ma-checkbox checked" id="ma20"><input type="checkbox" value="20" checked> MA20</label>
+                                <label class="ma-checkbox" id="ma60"><input type="checkbox" value="60"> MA60</label>
+                                <label class="ma-checkbox" id="ma120"><input type="checkbox" value="120"> MA120</label>
+                                <label class="ma-checkbox" id="ma240"><input type="checkbox" value="240"> MA240</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>自定义均线:</label>
+                            <input type="text" id="customMA" placeholder="例如: 30,90,180" style="width: 150px;">
+                            <button onclick="addCustomMA()" style="background: #17a2b8;">添加</button>
+                        </div>
+
+                        <div class="control-group">
+                            <button onclick="refreshData()" id="refreshBtn">刷新数据</button>
+                            <button onclick="updateData()" id="updateBtn" style="background: #28a745;">更新数据源</button>
+                        </div>
                     </div>
                 </div>
 
-                <div class="control-group">
-                    <label>坐标轴:</label>
-                    <div class="btn-group">
-                        <button id="btnLinear" class="active" onclick="setScale('linear')">普通</button>
-                        <button id="btnLog" onclick="setScale('log')">对数</button>
+                <div class="chart-container">
+                    <div id="chart"></div>
+                    <div class="loading" id="loading">加载中...</div>
+                </div>
+
+                <div class="info-grid" id="infoGrid">
+                    <div class="info-item">
+                        <h4>当前价格</h4>
+                        <p id="currentPrice">-</p>
+                    </div>
+                    <div class="info-item">
+                        <h4>最高价</h4>
+                        <p id="highPrice">-</p>
+                    </div>
+                    <div class="info-item">
+                        <h4>最低价</h4>
+                        <p id="lowPrice">-</p>
+                    </div>
+                    <div class="info-item">
+                        <h4>涨跌幅</h4>
+                        <p id="changePercent">-</p>
+                    </div>
+                    <div class="info-item">
+                        <h4>数据范围</h4>
+                        <p id="dateRange">-</p>
+                    </div>
+                    <div class="info-item">
+                        <h4>数据条数</h4>
+                        <p id="dataCount">-</p>
                     </div>
                 </div>
             </div>
 
-            <div class="control-row">
-                <div class="control-group">
-                    <label>均线:</label>
-                    <div class="ma-options">
-                        <label class="ma-checkbox" id="ma5"><input type="checkbox" value="5"> MA5</label>
-                        <label class="ma-checkbox checked" id="ma10"><input type="checkbox" value="10" checked> MA10</label>
-                        <label class="ma-checkbox checked" id="ma20"><input type="checkbox" value="20" checked> MA20</label>
-                        <label class="ma-checkbox" id="ma60"><input type="checkbox" value="60"> MA60</label>
-                        <label class="ma-checkbox" id="ma120"><input type="checkbox" value="120"> MA120</label>
-                        <label class="ma-checkbox" id="ma240"><input type="checkbox" value="240"> MA240</label>
+            <!-- ========== 价格预测面板 ========== -->
+            <div id="predictionPanel" class="panel">
+                <div class="panel-header">
+                    <h2>价格预测</h2>
+                    <p>基于多种策略的未来价格预测</p>
+                </div>
+
+                <div class="card">
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>币种:</label>
+                            <select id="predAssetSelect">
+                                <option value="BTC">Bitcoin (BTC)</option>
+                                <option value="ETH">Ethereum (ETH)</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>预测天数:</label>
+                            <select id="forecastDays">
+                                <option value="3">3天</option>
+                                <option value="7" selected>7天</option>
+                                <option value="14">14天</option>
+                                <option value="30">30天</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>模拟次数:</label>
+                            <select id="simulationCount">
+                                <option value="1000">1,000次</option>
+                                <option value="5000" selected>5,000次</option>
+                                <option value="10000">10,000次</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>策略:</label>
+                            <select id="predictionStrategy">
+                                <option value="monte_carlo">蒙特卡洛模拟</option>
+                                <option value="trend_following">趋势跟踪</option>
+                                <option value="mean_reversion">均值回归</option>
+                                <option value="ensemble">策略组合</option>
+                                <option value="regime_aware">状态感知</option>
+                                <option value="lstm">LSTM深度学习</option>
+                            </select>
+                        </div>
+                        <button onclick="runPrediction()" id="predictBtn" style="background: #e74c3c;">运行预测</button>
                     </div>
-                </div>
-            </div>
-
-            <div class="control-row">
-                <div class="control-group">
-                    <label>自定义均线:</label>
-                    <input type="text" id="customMA" placeholder="例如: 30,90,180" style="width: 150px;">
-                    <button onclick="addCustomMA()" style="margin-left: 5px; background: #17a2b8;">添加</button>
-                </div>
-
-                <div class="control-group">
-                    <button onclick="refreshData()" id="refreshBtn">刷新数据</button>
-                    <button onclick="updateData()" id="updateBtn" style="background: #28a745;">更新数据源</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- 图表区域 -->
-        <div class="chart-container">
-            <div id="chart"></div>
-            <div class="loading" id="loading">加载中...</div>
-        </div>
-
-        <!-- 信息面板 -->
-        <div class="info-panel">
-            <div class="info-grid" id="infoGrid">
-                <div class="info-item">
-                    <h4>当前价格</h4>
-                    <p id="currentPrice">-</p>
-                </div>
-                <div class="info-item">
-                    <h4>最高价</h4>
-                    <p id="highPrice">-</p>
-                </div>
-                <div class="info-item">
-                    <h4>最低价</h4>
-                    <p id="lowPrice">-</p>
-                </div>
-                <div class="info-item">
-                    <h4>涨跌幅</h4>
-                    <p id="changePercent">-</p>
-                </div>
-                <div class="info-item">
-                    <h4>数据范围</h4>
-                    <p id="dateRange">-</p>
-                </div>
-                <div class="info-item">
-                    <h4>数据条数</h4>
-                    <p id="dataCount">-</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- 预测和回测标签页 -->
-        <div class="prediction-panel">
-            <div class="tabs">
-                <button class="tab active" onclick="switchTab('prediction')">价格预测</button>
-                <button class="tab" onclick="switchTab('backtest')">策略回测</button>
-                <a href="/backtest_enhanced" style="margin-left: auto; padding: 12px 16px; color: #667eea; text-decoration: none; font-weight: 600; font-size: 14px;"
-                   onmouseover="this.style.color='#764ba2'" onmouseout="this.style.color='#667eea'"
-                   title="趋势跟踪、均值回归、策略组合、连续持仓、止损止盈">
-                    📈 策略回测
-                </a>
-                <a href="/portfolio" style="padding: 12px 16px; color: #11998e; text-decoration: none; font-weight: 600; font-size: 14px;"
-                   onmouseover="this.style.color='#0d7e74'" onmouseout="this.style.color='#11998e'"
-                   title="创建多个模拟仓位，手动或跟踪策略调仓，对比收益">
-                    📊 模拟持仓
-                </a>
-            </div>
-
-            <!-- 预测面板 -->
-            <div id="predictionTab" class="tab-content active">
-                <div class="prediction-controls">
-                    <div class="control-group">
-                        <label>预测天数:</label>
-                        <select id="forecastDays">
-                            <option value="3">3天</option>
-                            <option value="7" selected>7天</option>
-                            <option value="14">14天</option>
-                            <option value="30">30天</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>模拟次数:</label>
-                        <select id="simulationCount">
-                            <option value="1000">1,000次</option>
-                            <option value="5000" selected>5,000次</option>
-                            <option value="10000">10,000次</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>策略:</label>
-                        <select id="predictionStrategy">
-                            <option value="monte_carlo">蒙特卡洛模拟</option>
-                            <option value="trend_following">趋势跟踪</option>
-                            <option value="mean_reversion">均值回归</option>
-                            <option value="ensemble">策略组合</option>
-                            <option value="regime_aware">状态感知</option>
-                        </select>
-                    </div>
-                    <button onclick="runPrediction()" id="predictBtn" style="background: #e74c3c;">运行预测</button>
                 </div>
 
                 <div id="predictionResult" style="display: none;">
@@ -1667,12 +2366,12 @@ HTML_TEMPLATE = '''
                             <div class="value" style="font-size: 16px;" id="predConfidence">-</div>
                         </div>
                     </div>
-                    <div id="predictionChartContainer">
+                    <div class="card">
                         <img id="predictionChart" class="prediction-chart" style="display: none;">
                     </div>
                 </div>
 
-                <div id="predictionLoading" class="loading" style="display: none; position: relative; text-align: center; padding: 40px;">
+                <div id="predictionLoading" class="loading">
                     正在进行蒙特卡洛模拟...
                     <div class="progress-bar" style="margin-top: 20px; max-width: 400px; margin-left: auto; margin-right: auto;">
                         <div class="progress-fill" id="predictionProgress" style="width: 0%;"></div>
@@ -1680,180 +2379,423 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
 
-            <!-- 回测面板 -->
-            <div id="backtestTab" class="tab-content">
-                <div class="prediction-controls">
-                    <div class="control-group">
-                        <label>开始日期:</label>
-                        <input type="date" id="backtestStartDate" value="2024-01-01">
-                    </div>
-                    <div class="control-group">
-                        <label>结束日期:</label>
-                        <input type="date" id="backtestEndDate">
-                    </div>
-                    <div class="control-group">
-                        <label>预测天数:</label>
-                        <select id="backtestForecastDays">
-                            <option value="3">3天</option>
-                            <option value="7" selected>7天</option>
-                            <option value="14">14天</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>步进天数:</label>
-                        <select id="backtestStepDays">
-                            <option value="7" selected>7天</option>
-                            <option value="14">14天</option>
-                            <option value="30">30天</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>策略:</label>
-                        <select id="backtestStrategy">
-                            <option value="monte_carlo">蒙特卡洛模拟</option>
-                            <option value="trend_following" selected>趋势跟踪</option>
-                            <option value="mean_reversion">均值回归</option>
-                            <option value="ensemble">策略组合</option>
-                            <option value="regime_aware">状态感知</option>
-                        </select>
-                    </div>
-                    <button onclick="runBacktest()" id="backtestBtn" style="background: #9b59b6;">运行回测</button>
+            <!-- ========== 策略回测面板 ========== -->
+            <div id="backtestPanel" class="panel">
+                <div class="panel-header">
+                    <h2>策略回测</h2>
+                    <p>回测交易策略表现，支持详细调仓记录和AI分析</p>
                 </div>
 
-                <!-- 策略参数控制 -->
-                <div class="prediction-controls" style="background: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
-                    <h4 style="width: 100%; margin-bottom: 15px; color: #333;">策略交易参数</h4>
-                    <div class="control-group">
-                        <label>做多阈值 (%):</label>
-                        <input type="range" id="longThreshold" min="50" max="80" value="60" oninput="updateThresholdDisplay('long', this.value)">
-                        <span id="longThresholdValue" style="font-weight: 600; color: #27ae60;">60%</span>
+                <!-- 回测配置 -->
+                <div class="card">
+                    <h3 style="margin-bottom: 16px; font-size: 16px;">回测配置</h3>
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>币种:</label>
+                            <select id="backtestAssetSelect">
+                                <option value="BTC">Bitcoin (BTC)</option>
+                                <option value="ETH">Ethereum (ETH)</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>开始日期:</label>
+                            <input type="date" id="backtestStartDate" value="2024-01-01">
+                        </div>
+                        <div class="control-group">
+                            <label>结束日期:</label>
+                            <input type="date" id="backtestEndDate">
+                        </div>
+                        <div class="control-group">
+                            <label>策略:</label>
+                            <select id="backtestStrategy">
+                                <option value="monte_carlo">蒙特卡洛模拟</option>
+                                <option value="trend_following" selected>趋势跟踪</option>
+                                <option value="mean_reversion">均值回归</option>
+                                <option value="ensemble">策略组合</option>
+                                <option value="regime_aware">状态感知</option>
+                                <option value="lstm">LSTM深度学习</option>
+                            </select>
+                        </div>
                     </div>
-                    <div class="control-group">
-                        <label>做空阈值 (%):</label>
-                        <input type="range" id="shortThreshold" min="20" max="50" value="40" oninput="updateThresholdDisplay('short', this.value)">
-                        <span id="shortThresholdValue" style="font-weight: 600; color: #e74c3c;">40%</span>
-                    </div>
-                    <div class="control-group">
-                        <label>仓位管理:</label>
-                        <input type="checkbox" id="usePositionSizing" style="width: 20px; height: 20px;">
-                        <span style="font-size: 12px; color: #666;">根据置信度调整仓位</span>
-                    </div>
-                    <div class="control-group">
-                        <label>趋势过滤:</label>
-                        <select id="trendFilter">
-                            <option value="none">无过滤</option>
-                            <option value="bull_only">仅做多（牛市）</option>
-                            <option value="bear_only">仅做空（熊市）</option>
-                        </select>
-                    </div>
-                    <div class="control-group" style="flex: 1; min-width: 300px;">
-                        <span style="font-size: 12px; color: #666; font-style: italic;">
-                            提示: 降低阈值可提高参与度，启用仓位管理可根据预测强度自动调整仓位大小
-                        </span>
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>预测天数:</label>
+                            <select id="backtestForecastDays">
+                                <option value="3">3天</option>
+                                <option value="7" selected>7天</option>
+                                <option value="14">14天</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>步进天数:</label>
+                            <select id="backtestStepDays">
+                                <option value="7" selected>7天</option>
+                                <option value="14">14天</option>
+                                <option value="30">30天</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>初始资金:</label>
+                            <input type="number" id="backtestInitialCapital" value="10000" style="width: 100px;">
+                            <span>USDT</span>
+                        </div>
+                        <div class="control-group">
+                            <label>仓位比例:</label>
+                            <input type="range" id="backtestPositionSize" min="10" max="100" value="80" oninput="document.getElementById('posSizeValue').textContent = this.value + '%'">
+                            <span id="posSizeValue">80%</span>
+                        </div>
+                        <button onclick="runBacktest()" id="backtestBtn" style="background: #9b59b6;">运行回测</button>
                     </div>
                 </div>
 
-                <div id="backtestResult" style="display: none;">
-                    <h4 style="margin: 20px 0 15px 0; color: #333;">策略 vs 买入持有对比</h4>
-                    <div class="backtest-metrics" id="backtestMetrics">
-                        <div class="metric-card" style="border-left: 4px solid #667eea;">
-                            <h5>策略年化收益率</h5>
-                            <div class="metric-value" id="btAnnualReturn">-</div>
+                <!-- 策略参数 -->
+                <div class="card">
+                    <h3 style="margin-bottom: 16px; font-size: 16px;">策略参数</h3>
+                    <div class="control-row">
+                        <div class="control-group">
+                            <label>做多阈值 (%):</label>
+                            <input type="range" id="longThreshold" min="50" max="80" value="60" oninput="updateThresholdDisplay('long', this.value)">
+                            <span id="longThresholdValue" style="font-weight: 600; color: #27ae60;">60%</span>
                         </div>
-                        <div class="metric-card" style="border-left: 4px solid #95a5a6;">
-                            <h5>买入持有年化收益</h5>
-                            <div class="metric-value" id="btBuyHoldAnnual">-</div>
+                        <div class="control-group">
+                            <label>做空阈值 (%):</label>
+                            <input type="range" id="shortThreshold" min="20" max="50" value="40" oninput="updateThresholdDisplay('short', this.value)">
+                            <span id="shortThresholdValue" style="font-weight: 600; color: #e74c3c;">40%</span>
                         </div>
-                        <div class="metric-card" style="border-left: 4px solid #27ae60;">
-                            <h5>超额年化收益</h5>
-                            <div class="metric-value" id="btExcessReturn">-</div>
+                        <div class="control-group">
+                            <label>止损 (%):</label>
+                            <input type="number" id="stopLossPct" value="10" style="width: 60px;">
                         </div>
-                        <div class="metric-card">
-                            <h5>策略总收益率</h5>
-                            <div class="metric-value" id="btReturn">-</div>
+                        <div class="control-group">
+                            <label>止盈 (%):</label>
+                            <input type="number" id="takeProfitPct" value="20" style="width: 60px;">
                         </div>
-                        <div class="metric-card">
-                            <h5>买入持有总收益</h5>
-                            <div class="metric-value" id="btBuyHoldReturn">-</div>
+                        <div class="control-group">
+                            <label>复利:</label>
+                            <input type="checkbox" id="useCompound" checked style="width: 20px; height: 20px;">
                         </div>
-                        <div class="metric-card">
-                            <h5>回测期间天数</h5>
-                            <div class="metric-value" id="btPeriodDays">-</div>
-                        </div>
-                    </div>
-
-                    <h4 style="margin: 25px 0 15px 0; color: #333;">策略准确性</h4>
-                    <div class="backtest-metrics">
-                        <div class="metric-card">
-                            <h5>方向准确率</h5>
-                            <div class="metric-value" id="btAccuracy">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>上涨预测准确率</h5>
-                            <div class="metric-value" id="btAccuracyUp">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>下跌预测准确率</h5>
-                            <div class="metric-value" id="btAccuracyDown">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>MAPE (误差率)</h5>
-                            <div class="metric-value" id="btMAPE">-</div>
-                        </div>
-                    </div>
-
-                    <h4 style="margin: 25px 0 15px 0; color: #333;">风险指标</h4>
-                    <div class="backtest-metrics">
-                        <div class="metric-card">
-                            <h5>策略最大回撤</h5>
-                            <div class="metric-value" id="btDrawdown">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>买入持有最大回撤</h5>
-                            <div class="metric-value" id="btBuyHoldDrawdown">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>年化波动率</h5>
-                            <div class="metric-value" id="btVolatility">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>VaR 95% (风险价值)</h5>
-                            <div class="metric-value" id="btVaR">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>夏普比率</h5>
-                            <div class="metric-value" id="btSharpe">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>买入持有夏普</h5>
-                            <div class="metric-value" id="btBuyHoldSharpe">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>胜率</h5>
-                            <div class="metric-value" id="btWinRate">-</div>
-                        </div>
-                        <div class="metric-card">
-                            <h5>盈亏比</h5>
-                            <div class="metric-value" id="btPLRatio">-</div>
-                        </div>
-                    </div>
-                    <div id="backtestChartContainer">
-                        <img id="backtestChart" class="prediction-chart" style="display: none;">
                     </div>
                 </div>
 
-                <div id="backtestLoading" class="loading" style="display: none; position: relative; text-align: center; padding: 40px;">
+                <!-- 回测加载 -->
+                <div id="backtestLoading" class="loading">
                     正在进行回测...
                     <div class="progress-bar" style="margin-top: 20px; max-width: 400px; margin-left: auto; margin-right: auto;">
                         <div class="progress-fill" id="backtestProgress" style="width: 0%;"></div>
                     </div>
                 </div>
+
+                <!-- 回测结果 -->
+                <div id="backtestResult" style="display: none;">
+                    <!-- 收益对比 -->
+                    <div class="card">
+                        <h3 style="margin-bottom: 16px; font-size: 16px;">策略 vs 买入持有对比</h3>
+                        <div class="backtest-metrics">
+                            <div class="metric-card" style="border-left: 4px solid #667eea;">
+                                <h5>策略年化收益率</h5>
+                                <div class="metric-value" id="btAnnualReturn">-</div>
+                            </div>
+                            <div class="metric-card" style="border-left: 4px solid #95a5a6;">
+                                <h5>买入持有年化收益</h5>
+                                <div class="metric-value" id="btBuyHoldAnnual">-</div>
+                            </div>
+                            <div class="metric-card" style="border-left: 4px solid #27ae60;">
+                                <h5>超额年化收益</h5>
+                                <div class="metric-value" id="btExcessReturn">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>策略总收益率</h5>
+                                <div class="metric-value" id="btReturn">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>买入持有总收益</h5>
+                                <div class="metric-value" id="btBuyHoldReturn">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>回测期间天数</h5>
+                                <div class="metric-value" id="btPeriodDays">-</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- AI分析面板 -->
+                    <div id="analysisPanel" class="analysis-panel" style="display: none;">
+                        <h4>🤖 Claude AI 分析</h4>
+                        <div id="analysisContent" class="analysis-content"></div>
+                        <div id="analysisLoading" style="display: none; padding: 20px; text-align: center;">
+                            正在分析中...
+                        </div>
+                    </div>
+
+                    <div style="text-align: center; margin: 16px 0;">
+                        <button id="analyzeBtn" onclick="analyzeBacktest()" style="display: none; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                            🤖 分析策略表现
+                        </button>
+                    </div>
+
+                    <!-- 风险指标 -->
+                    <div class="card">
+                        <h3 style="margin-bottom: 16px; font-size: 16px;">风险指标</h3>
+                        <div class="backtest-metrics">
+                            <div class="metric-card">
+                                <h5>策略最大回撤</h5>
+                                <div class="metric-value" id="btDrawdown">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>买入持有最大回撤</h5>
+                                <div class="metric-value" id="btBuyHoldDrawdown">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>年化波动率</h5>
+                                <div class="metric-value" id="btVolatility">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>VaR 95%</h5>
+                                <div class="metric-value" id="btVaR">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>夏普比率</h5>
+                                <div class="metric-value" id="btSharpe">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>买入持有夏普</h5>
+                                <div class="metric-value" id="btBuyHoldSharpe">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>胜率</h5>
+                                <div class="metric-value" id="btWinRate">-</div>
+                            </div>
+                            <div class="metric-card">
+                                <h5>盈亏比</h5>
+                                <div class="metric-value" id="btPLRatio">-</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 图表 -->
+                    <div class="card">
+                        <img id="backtestChart" class="prediction-chart" style="display: none;">
+                    </div>
+
+                    <!-- 调仓记录 -->
+                    <div class="card">
+                        <h3 style="margin-bottom: 16px; font-size: 16px;">调仓记录</h3>
+                        <div id="tradesTable" style="overflow-x: auto;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>入场日期</th>
+                                        <th>出场日期</th>
+                                        <th>方向</th>
+                                        <th>入场价</th>
+                                        <th>出场价</th>
+                                        <th>盈亏</th>
+                                        <th>出场原因</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tradesTableBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- 仓位时间线 -->
+                    <div class="card">
+                        <h3 style="margin-bottom: 16px; font-size: 16px;">仓位变化时间线</h3>
+                        <div id="positionTimeline" class="position-timeline"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== 仓位管理面板 ========== -->
+            <div id="portfolioPanel" class="panel">
+                <div class="panel-header">
+                    <h2>仓位管理</h2>
+                    <p>管理模拟仓位，跟踪收益表现</p>
+                </div>
+
+                <div class="two-column">
+                    <!-- 左侧：仓位列表 -->
+                    <div>
+                        <div class="card">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                                <h3 style="font-size: 16px;">我的仓位</h3>
+                                <button onclick="openPortfolioModal()" style="padding: 6px 12px; font-size: 13px;">+ 新建仓位</button>
+                            </div>
+                            <div id="portfolioList" class="portfolio-list">
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">💼</div>
+                                    <h3>暂无仓位</h3>
+                                    <p>点击上方按钮创建第一个模拟仓位</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 仓位对比 -->
+                        <div class="card">
+                            <h3 style="margin-bottom: 16px; font-size: 16px;">收益对比</h3>
+                            <div id="portfolioComparison">
+                                <div class="empty-state" style="padding: 30px;">
+                                    <p>创建多个仓位后可进行收益对比</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 右侧：仓位详情 -->
+                    <div>
+                        <div id="portfolioDetail" style="display: none;">
+                            <div class="card">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                                    <div>
+                                        <h3 id="detailPortfolioName" style="font-size: 18px;">-</h3>
+                                        <span id="detailPortfolioAsset" class="portfolio-asset">-</span>
+                                    </div>
+                                    <div>
+                                        <button onclick="openTradeModal()" style="margin-right: 8px;">添加交易</button>
+                                        <button onclick="deletePortfolio()" class="danger" style="background: #dc3545;">删除</button>
+                                    </div>
+                                </div>
+
+                                <div class="backtest-metrics" style="margin-bottom: 20px;">
+                                    <div class="metric-card">
+                                        <h5>持仓数量</h5>
+                                        <div class="metric-value" id="detailQuantity">-</div>
+                                    </div>
+                                    <div class="metric-card">
+                                        <h5>平均成本</h5>
+                                        <div class="metric-value" id="detailAvgCost">-</div>
+                                    </div>
+                                    <div class="metric-card">
+                                        <h5>当前价格</h5>
+                                        <div class="metric-value" id="detailCurrentPrice">-</div>
+                                    </div>
+                                    <div class="metric-card">
+                                        <h5>浮动盈亏</h5>
+                                        <div class="metric-value" id="detailUnrealizedPnl">-</div>
+                                    </div>
+                                    <div class="metric-card">
+                                        <h5>已实现盈亏</h5>
+                                        <div class="metric-value" id="detailRealizedPnl">-</div>
+                                    </div>
+                                    <div class="metric-card">
+                                        <h5>总收益率</h5>
+                                        <div class="metric-value" id="detailTotalReturn">-</div>
+                                    </div>
+                                </div>
+
+                                <h4 style="margin-bottom: 12px; font-size: 14px;">权益曲线</h4>
+                                <div id="equityChart" class="equity-chart">加载中...</div>
+                            </div>
+
+                            <div class="card">
+                                <h3 style="margin-bottom: 16px; font-size: 16px;">交易记录</h3>
+                                <div id="tradeList" class="trade-list">
+                                    <p style="text-align: center; color: #666; padding: 20px;">暂无交易记录</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="portfolioEmpty" class="card">
+                            <div class="empty-state">
+                                <div class="empty-state-icon">📊</div>
+                                <h3>选择一个仓位</h3>
+                                <p>点击左侧仓位查看详情和交易记录</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 全局日志 -->
+            <div class="log-container" id="logContainer">
+                <div class="log-entry">系统就绪...</div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 新建仓位模态框 -->
+    <div id="portfolioModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>新建仓位</h3>
+                <button class="modal-close" onclick="closePortfolioModal()">&times;</button>
+            </div>
+            <div class="form-group">
+                <label>仓位名称</label>
+                <input type="text" id="newPortfolioName" placeholder="例如：BTC长期持有">
+            </div>
+            <div class="form-group">
+                <label>币种</label>
+                <select id="newPortfolioAsset">
+                    <option value="BTC">Bitcoin (BTC)</option>
+                    <option value="ETH">Ethereum (ETH)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>初始资金 (USDT)</label>
+                <input type="number" id="newPortfolioCapital" value="10000">
+            </div>
+            <div class="form-group">
+                <label>模式</label>
+                <select id="newPortfolioMode">
+                    <option value="manual">手动交易</option>
+                    <option value="strategy">策略跟踪</option>
+                </select>
+            </div>
+            <div class="form-group" id="strategySelectGroup" style="display: none;">
+                <label>跟踪策略</label>
+                <select id="newPortfolioStrategy">
+                    <option value="trend_following">趋势跟踪</option>
+                    <option value="mean_reversion">均值回归</option>
+                    <option value="ensemble">策略组合</option>
+                    <option value="lstm">LSTM深度学习</option>
+                </select>
+            </div>
+            <div class="form-actions">
+                <button class="secondary" onclick="closePortfolioModal()">取消</button>
+                <button onclick="createPortfolio()">创建</button>
             </div>
         </div>
+    </div>
 
-        <!-- 日志区域 -->
-        <div class="log-container" id="logContainer">
-            <div class="log-entry">系统就绪...</div>
+    <!-- 添加交易模态框 -->
+    <div id="tradeModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>添加交易</h3>
+                <button class="modal-close" onclick="closeTradeModal()">&times;</button>
+            </div>
+            <div class="form-group">
+                <label>交易类型</label>
+                <select id="tradeType">
+                    <option value="buy">买入</option>
+                    <option value="sell">卖出</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>交易日期</label>
+                <input type="date" id="tradeDate">
+            </div>
+            <div class="form-group">
+                <label>价格 (USDT)</label>
+                <input type="number" id="tradePrice" step="0.01">
+            </div>
+            <div class="form-group">
+                <label>数量</label>
+                <input type="number" id="tradeQuantity" step="0.0001">
+            </div>
+            <div class="form-group">
+                <label>手续费 (USDT)</label>
+                <input type="number" id="tradeFee" value="0" step="0.01">
+            </div>
+            <div class="form-group">
+                <label>备注</label>
+                <input type="text" id="tradeNote" placeholder="可选">
+            </div>
+            <div class="form-actions">
+                <button class="secondary" onclick="closeTradeModal()">取消</button>
+                <button onclick="addTrade()">添加</button>
+            </div>
         </div>
     </div>
 
@@ -1869,11 +2811,57 @@ HTML_TEMPLATE = '''
             maPeriods: [10, 20]
         };
 
+        // 当前回测结果缓存（用于AI分析）
+        let currentBacktestResult = null;
+
+        // 当前选中的仓位
+        let currentPortfolioId = null;
+
+        // ============== 面板切换 ==============
+        function switchPanel(panelName) {
+            // 更新导航状态
+            document.querySelectorAll('.nav-item').forEach(item => {
+                item.classList.remove('active');
+            });
+            event.target.closest('.nav-item').classList.add('active');
+
+            // 切换面板显示
+            document.querySelectorAll('.panel').forEach(panel => {
+                panel.classList.remove('active');
+            });
+            document.getElementById(panelName + 'Panel').classList.add('active');
+
+            // 移动端关闭侧边栏
+            if (window.innerWidth <= 768) {
+                document.getElementById('sidebar').classList.remove('open');
+            }
+
+            log(`切换到${panelName}面板`);
+
+            // 面板特定初始化
+            if (panelName === 'portfolio') {
+                loadPortfolios();
+            }
+        }
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
         // ============== 初始化 ==============
         document.addEventListener('DOMContentLoaded', function() {
             initChart();
             loadData();
             setupEventListeners();
+
+            // 同步币种选择器
+            document.getElementById('predAssetSelect').value = currentState.asset;
+            document.getElementById('backtestAssetSelect').value = currentState.asset;
+
+            // 初始化日期
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById('backtestEndDate').value = today;
+            document.getElementById('tradeDate').value = today;
         });
 
         // ============== 图表初始化 ==============
@@ -2184,7 +3172,7 @@ HTML_TEMPLATE = '''
             loadData();
         }
 
-        // ============== 标签页切换 ==============
+        // ============== 标签页切换 (旧版，保留兼容) ==============
         function switchTab(tab) {
             // 切换按钮状态
             document.querySelectorAll('.tab').forEach(btn => {
@@ -2201,6 +3189,7 @@ HTML_TEMPLATE = '''
 
         // ============== 预测功能 ==============
         async function runPrediction() {
+            const asset = document.getElementById('predAssetSelect').value;
             const btn = document.getElementById('predictBtn');
             const resultDiv = document.getElementById('predictionResult');
             const loadingDiv = document.getElementById('predictionLoading');
@@ -2211,14 +3200,14 @@ HTML_TEMPLATE = '''
 
             btn.disabled = true;
             resultDiv.style.display = 'none';
-            loadingDiv.style.display = 'block';
+            loadingDiv.classList.add('show');
 
-            log(`开始预测 ${currentState.asset}，策略: ${strategy}，天数: ${forecastDays}`);
+            log(`开始预测 ${asset}，策略: ${strategy}，天数: ${forecastDays}`);
 
             try {
                 // 先获取预测数据
                 const response = await fetch(
-                    `/api/predict/${currentState.asset}?days=${forecastDays}&simulations=${simulations}&strategy=${strategy}`
+                    `/api/predict/${asset}?days=${forecastDays}&simulations=${simulations}&strategy=${strategy}`
                 );
                 const result = await response.json();
 
@@ -2246,7 +3235,7 @@ HTML_TEMPLATE = '''
                 // 获取并显示图表
                 log('正在生成预测图表...');
                 const chartResponse = await fetch(
-                    `/api/predict/${currentState.asset}/chart?days=${forecastDays}&simulations=${Math.min(simulations, 5000)}`
+                    `/api/predict/${asset}/chart?days=${forecastDays}&simulations=${Math.min(simulations, 5000)}`
                 );
                 const chartResult = await chartResponse.json();
 
@@ -2262,7 +3251,7 @@ HTML_TEMPLATE = '''
                 log(`预测失败: ${error.message}`, 'error');
             } finally {
                 btn.disabled = false;
-                loadingDiv.style.display = 'none';
+                loadingDiv.classList.remove('show');
             }
         }
 
@@ -2271,27 +3260,23 @@ HTML_TEMPLATE = '''
             document.getElementById(type + 'ThresholdValue').textContent = value + '%';
         }
 
-        function getStrategyParams() {
-            return {
-                long_threshold: parseInt(document.getElementById('longThreshold').value),
-                short_threshold: parseInt(document.getElementById('shortThreshold').value),
-                use_position_sizing: document.getElementById('usePositionSizing').checked,
-                trend_filter: document.getElementById('trendFilter').value
-            };
-        }
-
-        // ============== 回测功能 ==============
+        // ============== 增强回测功能 ==============
         async function runBacktest() {
             const btn = document.getElementById('backtestBtn');
             const resultDiv = document.getElementById('backtestResult');
             const loadingDiv = document.getElementById('backtestLoading');
 
+            const asset = document.getElementById('backtestAssetSelect').value;
             const startDate = document.getElementById('backtestStartDate').value;
             const endDate = document.getElementById('backtestEndDate').value;
             const forecastDays = document.getElementById('backtestForecastDays').value;
             const stepDays = document.getElementById('backtestStepDays').value;
             const strategy = document.getElementById('backtestStrategy').value;
-            const strategyParams = getStrategyParams();
+            const initialCapital = document.getElementById('backtestInitialCapital').value;
+            const positionSize = document.getElementById('backtestPositionSize').value / 100;
+            const stopLoss = document.getElementById('stopLossPct').value;
+            const takeProfit = document.getElementById('takeProfitPct').value;
+            const useCompound = document.getElementById('useCompound').checked;
 
             if (!startDate || !endDate) {
                 log('请选择开始和结束日期', 'error');
@@ -2300,14 +3285,13 @@ HTML_TEMPLATE = '''
 
             btn.disabled = true;
             resultDiv.style.display = 'none';
-            loadingDiv.style.display = 'block';
+            loadingDiv.classList.add('show');
 
-            log(`开始回测 ${currentState.asset}，策略: ${strategy}，期间: ${startDate} 至 ${endDate}`);
-            log(`策略参数 - 做多阈值: ${strategyParams.long_threshold}%, 做空阈值: ${strategyParams.short_threshold}%, 仓位管理: ${strategyParams.use_position_sizing ? '启用' : '禁用'}, 趋势过滤: ${strategyParams.trend_filter}`);
+            log(`开始回测 ${asset}，策略: ${strategy}，期间: ${startDate} 至 ${endDate}`);
 
             try {
-                // 运行回测
-                const response = await fetch(`/api/backtest/${currentState.asset}`, {
+                // 使用增强回测引擎
+                const response = await fetch(`/api/backtest/${asset}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -2316,8 +3300,15 @@ HTML_TEMPLATE = '''
                         end_date: endDate,
                         forecast_days: parseInt(forecastDays),
                         step_days: parseInt(stepDays),
-                        simulations: 5000,
-                        strategy_params: strategyParams
+                        engine: 'enhanced',
+                        enhanced_params: {
+                            initial_capital: parseFloat(initialCapital),
+                            position_size: positionSize,
+                            use_compound: useCompound,
+                            stop_loss_pct: parseFloat(stopLoss),
+                            take_profit_pct: parseFloat(takeProfit),
+                            rebalance_freq: 'daily'
+                        }
                     })
                 });
 
@@ -2327,72 +3318,506 @@ HTML_TEMPLATE = '''
                     throw new Error(result.error);
                 }
 
-                // 显示回测指标 - 收益对比
-                document.getElementById('btAnnualReturn').textContent = `${result.metrics.trading_annual_return >= 0 ? '+' : ''}${result.metrics.trading_annual_return.toFixed(2)}%`;
-                document.getElementById('btBuyHoldAnnual').textContent = `${result.metrics.buy_hold_annual_return >= 0 ? '+' : ''}${result.metrics.buy_hold_annual_return.toFixed(2)}%`;
-                document.getElementById('btExcessReturn').textContent = `${result.metrics.excess_annual_return >= 0 ? '+' : ''}${result.metrics.excess_annual_return.toFixed(2)}%`;
-                document.getElementById('btReturn').textContent = `${result.metrics.trading_return >= 0 ? '+' : ''}${result.metrics.trading_return.toFixed(2)}%`;
-                document.getElementById('btBuyHoldReturn').textContent = `${result.metrics.buy_hold_return >= 0 ? '+' : ''}${result.metrics.buy_hold_return.toFixed(2)}%`;
-                document.getElementById('btPeriodDays').textContent = `${result.period_days}天`;
+                // 缓存结果用于AI分析
+                currentBacktestResult = result;
 
-                // 设置颜色
-                document.getElementById('btAnnualReturn').className = 'metric-value ' + (result.metrics.trading_annual_return >= 0 ? 'positive' : 'negative');
-                document.getElementById('btExcessReturn').className = 'metric-value ' + (result.metrics.excess_annual_return >= 0 ? 'positive' : 'negative');
-                document.getElementById('btReturn').className = 'metric-value ' + (result.metrics.trading_return >= 0 ? 'positive' : 'negative');
+                // 显示回测指标
+                displayBacktestMetrics(result);
 
-                // 准确性指标
-                document.getElementById('btAccuracy').textContent = `${result.metrics.direction_accuracy.toFixed(2)}%`;
-                document.getElementById('btAccuracyUp').textContent = `${result.metrics.direction_accuracy_up.toFixed(2)}%`;
-                document.getElementById('btAccuracyDown').textContent = `${result.metrics.direction_accuracy_down.toFixed(2)}%`;
-                document.getElementById('btMAPE').textContent = `${result.metrics.mape.toFixed(2)}%`;
+                // 显示调仓记录
+                displayTrades(result.trades);
 
-                // 风险指标
-                document.getElementById('btDrawdown').textContent = `${result.metrics.max_drawdown.toFixed(2)}%`;
-                document.getElementById('btBuyHoldDrawdown').textContent = `${result.metrics.buy_hold_max_drawdown.toFixed(2)}%`;
-                document.getElementById('btVolatility').textContent = `${result.metrics.annual_volatility.toFixed(2)}%`;
-                document.getElementById('btVaR').textContent = `${result.metrics.var_95.toFixed(2)}%`;
-                document.getElementById('btSharpe').textContent = result.metrics.trading_sharpe.toFixed(2);
-                document.getElementById('btBuyHoldSharpe').textContent = result.metrics.buy_hold_sharpe.toFixed(2);
-                document.getElementById('btWinRate').textContent = `${result.metrics.win_rate.toFixed(2)}%`;
-                document.getElementById('btPLRatio').textContent = result.metrics.profit_loss_ratio.toFixed(2);
+                // 显示仓位时间线
+                displayPositionTimeline(result.position_history);
 
-                // 获取并显示图表
-                log('正在生成回测图表...');
-                const chartResponse = await fetch(`/api/backtest/${currentState.asset}/chart`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        strategy: strategy,
-                        start_date: startDate,
-                        end_date: endDate,
-                        forecast_days: parseInt(forecastDays),
-                        step_days: parseInt(stepDays),
-                        simulations: 5000,
-                        strategy_params: strategyParams
-                    })
-                });
-
-                const chartResult = await chartResponse.json();
-
-                if (chartResult.image) {
-                    document.getElementById('backtestChart').src = chartResult.image;
+                // 显示图表
+                if (result.equity_curve_chart) {
+                    document.getElementById('backtestChart').src = result.equity_curve_chart;
                     document.getElementById('backtestChart').style.display = 'block';
                 }
 
+                // 如果策略不如买入持有，显示分析按钮
+                const analyzeBtn = document.getElementById('analyzeBtn');
+                const analysisPanel = document.getElementById('analysisPanel');
+                if (result.metrics.trading_return < result.metrics.buy_hold_return) {
+                    analyzeBtn.style.display = 'inline-block';
+                    analysisPanel.style.display = 'none';
+                } else {
+                    analyzeBtn.style.display = 'none';
+                    analysisPanel.style.display = 'none';
+                }
+
                 resultDiv.style.display = 'block';
-                log(`回测完成，方向准确率: ${result.metrics.direction_accuracy.toFixed(2)}%`, 'success');
+                log(`回测完成，策略收益: ${result.metrics.trading_return.toFixed(2)}%，买入持有: ${result.metrics.buy_hold_return.toFixed(2)}%`, 'success');
 
             } catch (error) {
                 log(`回测失败: ${error.message}`, 'error');
             } finally {
                 btn.disabled = false;
-                loadingDiv.style.display = 'none';
+                loadingDiv.classList.remove('show');
             }
         }
 
+        function displayBacktestMetrics(result) {
+            const m = result.metrics;
+
+            // 收益对比
+            document.getElementById('btAnnualReturn').textContent = `${m.trading_annual_return >= 0 ? '+' : ''}${m.trading_annual_return.toFixed(2)}%`;
+            document.getElementById('btBuyHoldAnnual').textContent = `${m.buy_hold_annual_return >= 0 ? '+' : ''}${m.buy_hold_annual_return.toFixed(2)}%`;
+            document.getElementById('btExcessReturn').textContent = `${m.trading_annual_return - m.buy_hold_annual_return >= 0 ? '+' : ''}${(m.trading_annual_return - m.buy_hold_annual_return).toFixed(2)}%`;
+            document.getElementById('btReturn').textContent = `${m.trading_return >= 0 ? '+' : ''}${m.trading_return.toFixed(2)}%`;
+            document.getElementById('btBuyHoldReturn').textContent = `${m.buy_hold_return >= 0 ? '+' : ''}${m.buy_hold_return.toFixed(2)}%`;
+            document.getElementById('btPeriodDays').textContent = `${result.period_days}天`;
+
+            // 设置颜色
+            document.getElementById('btAnnualReturn').className = 'metric-value ' + (m.trading_annual_return >= 0 ? 'positive' : 'negative');
+            document.getElementById('btExcessReturn').className = 'metric-value ' + (m.trading_annual_return - m.buy_hold_annual_return >= 0 ? 'positive' : 'negative');
+            document.getElementById('btReturn').className = 'metric-value ' + (m.trading_return >= 0 ? 'positive' : 'negative');
+
+            // 风险指标
+            document.getElementById('btDrawdown').textContent = `${m.max_drawdown.toFixed(2)}%`;
+            document.getElementById('btBuyHoldDrawdown').textContent = `${m.buy_hold_max_drawdown.toFixed(2)}%`;
+            document.getElementById('btVolatility').textContent = `${m.annual_volatility.toFixed(2)}%`;
+            document.getElementById('btVaR').textContent = `${m.var_95.toFixed(2)}%`;
+            document.getElementById('btSharpe').textContent = m.trading_sharpe.toFixed(2);
+            document.getElementById('btBuyHoldSharpe').textContent = m.buy_hold_sharpe.toFixed(2);
+            document.getElementById('btWinRate').textContent = `${m.win_rate.toFixed(2)}%`;
+            document.getElementById('btPLRatio').textContent = m.profit_loss_ratio.toFixed(2);
+        }
+
+        function displayTrades(trades) {
+            const tbody = document.getElementById('tradesTableBody');
+            if (!trades || trades.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #666;">暂无交易记录</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = trades.map(t => `
+                <tr>
+                    <td>${t.entry_date}</td>
+                    <td>${t.exit_date}</td>
+                    <td><span style="color: ${t.direction === 'LONG' ? '#27ae60' : '#e74c3c'}">${t.direction}</span></td>
+                    <td>$${t.entry_price.toLocaleString()}</td>
+                    <td>$${t.exit_price.toLocaleString()}</td>
+                    <td style="color: ${t.pnl >= 0 ? '#27ae60' : '#e74c3c'}">${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}%</td>
+                    <td>${t.exit_reason}</td>
+                </tr>
+            `).join('');
+        }
+
+        function displayPositionTimeline(history) {
+            const container = document.getElementById('positionTimeline');
+            if (!history || history.length === 0) {
+                container.innerHTML = '<p style="text-align: center; color: #666;">无仓位变化记录</p>';
+                return;
+            }
+
+            // 只显示关键变化点
+            const changes = [];
+            let lastPosition = null;
+            history.forEach(h => {
+                if (h.position !== lastPosition) {
+                    changes.push(h);
+                    lastPosition = h.position;
+                }
+            });
+
+            container.innerHTML = changes.map(h => `
+                <div class="timeline-item">
+                    <div class="timeline-date">${h.date}</div>
+                    <div class="timeline-content">
+                        <div class="timeline-action">${h.position === 'LONG' ? '做多' : h.position === 'SHORT' ? '做空' : '平仓'}</div>
+                        <div class="timeline-reason">${h.reason || '信号变化'}</div>
+                    </div>
+                    <div class="timeline-pnl ${(h.unrealized_pnl || 0) >= 0 ? 'positive' : 'negative'}">
+                        ${h.unrealized_pnl ? (h.unrealized_pnl >= 0 ? '+' : '') + h.unrealized_pnl.toFixed(2) : '0.00'}%
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // ============== AI 分析功能 ==============
+        async function analyzeBacktest() {
+            if (!currentBacktestResult) {
+                log('请先运行回测', 'error');
+                return;
+            }
+
+            const analysisPanel = document.getElementById('analysisPanel');
+            const analysisContent = document.getElementById('analysisContent');
+            const analysisLoading = document.getElementById('analysisLoading');
+            const analyzeBtn = document.getElementById('analyzeBtn');
+
+            analyzeBtn.disabled = true;
+            analysisPanel.style.display = 'block';
+            analysisLoading.style.display = 'block';
+            analysisContent.style.display = 'none';
+
+            log('正在请求AI分析...');
+
+            try {
+                const response = await fetch(`/api/backtest/${currentBacktestResult.asset}/analyze`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        strategy: currentBacktestResult.strategy_name,
+                        strategy_params: currentBacktestResult.strategy_params || {},
+                        metrics: currentBacktestResult.metrics,
+                        trades: currentBacktestResult.trades,
+                        position_history: currentBacktestResult.position_history,
+                        buy_hold_return: currentBacktestResult.metrics.buy_hold_return,
+                        strategy_return: currentBacktestResult.metrics.trading_return,
+                        start_date: currentBacktestResult.start_date,
+                        end_date: currentBacktestResult.end_date
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+
+                // 显示分析结果
+                analysisContent.innerHTML = `
+                    <p>${result.analysis}</p>
+                    ${result.key_findings && result.key_findings.length > 0 ? `
+                        <h5 style="margin-top: 16px;">🔍 关键发现</h5>
+                        <ul class="finding-list">
+                            ${result.key_findings.map(f => `<li>${f}</li>`).join('')}
+                        </ul>
+                    ` : ''}
+                    ${result.improvement_suggestions && result.improvement_suggestions.length > 0 ? `
+                        <h5 style="margin-top: 16px;">💡 改进建议</h5>
+                        <ul class="suggestion-list">
+                            ${result.improvement_suggestions.map(s => `<li>${s}</li>`).join('')}
+                        </ul>
+                    ` : ''}
+                `;
+
+                analysisContent.style.display = 'block';
+                log('AI分析完成', 'success');
+
+            } catch (error) {
+                analysisContent.innerHTML = `<p style="color: #e74c3c;">分析失败: ${error.message}</p>`;
+                analysisContent.style.display = 'block';
+                log(`AI分析失败: ${error.message}`, 'error');
+            } finally {
+                analysisLoading.style.display = 'none';
+                analyzeBtn.disabled = false;
+            }
+        }
+
+        // ============== 仓位管理功能 ==============
+        async function loadPortfolios() {
+            try {
+                const response = await fetch('/api/portfolios');
+                const portfolios = await response.json();
+
+                const container = document.getElementById('portfolioList');
+                if (portfolios.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">💼</div>
+                            <h3>暂无仓位</h3>
+                            <p>点击上方按钮创建第一个模拟仓位</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                container.innerHTML = portfolios.map(p => `
+                    <div class="portfolio-item ${p.id === currentPortfolioId ? 'active' : ''}" onclick="selectPortfolio(${p.id})">
+                        <div class="portfolio-header">
+                            <span class="portfolio-name">${p.name}</span>
+                            <span class="portfolio-asset">${p.asset_code}</span>
+                        </div>
+                        <div class="portfolio-stats">
+                            <span>持仓: ${p.current_quantity.toFixed(4)}</span>
+                            <span>成本: $${p.avg_cost.toFixed(2)}</span>
+                            <span class="portfolio-return ${p.total_return >= 0 ? 'positive' : 'negative'}">
+                                ${p.total_return >= 0 ? '+' : ''}${p.total_return.toFixed(2)}%
+                            </span>
+                        </div>
+                    </div>
+                `).join('');
+
+                // 更新对比面板
+                updatePortfolioComparison(portfolios);
+
+            } catch (error) {
+                log(`加载仓位失败: ${error.message}`, 'error');
+            }
+        }
+
+        function updatePortfolioComparison(portfolios) {
+            const container = document.getElementById('portfolioComparison');
+            if (portfolios.length < 2) {
+                container.innerHTML = '<div class="empty-state" style="padding: 30px;"><p>创建多个仓位后可进行收益对比</p></div>';
+                return;
+            }
+
+            const sorted = [...portfolios].sort((a, b) => b.total_return - a.total_return);
+            const maxReturn = Math.max(...sorted.map(p => Math.abs(p.total_return)), 1);
+
+            container.innerHTML = sorted.map((p, i) => `
+                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                    <span style="width: 24px; text-align: center; font-weight: 600; color: ${i === 0 ? '#f1c40f' : i === 1 ? '#95a5a6' : i === 2 ? '#cd7f32' : '#666'};">${i + 1}</span>
+                    <span style="flex: 1; font-size: 14px;">${p.name}</span>
+                    <div style="flex: 2; background: #e0e0e0; height: 20px; border-radius: 10px; overflow: hidden;">
+                        <div style="width: ${(Math.abs(p.total_return) / maxReturn * 100).toFixed(1)}%; height: 100%; background: ${p.total_return >= 0 ? '#27ae60' : '#e74c3c'};"></div>
+                    </div>
+                    <span style="width: 70px; text-align: right; font-weight: 600; color: ${p.total_return >= 0 ? '#27ae60' : '#e74c3c'};">${p.total_return >= 0 ? '+' : ''}${p.total_return.toFixed(2)}%</span>
+                </div>
+            `).join('');
+        }
+
+        async function selectPortfolio(id) {
+            currentPortfolioId = id;
+            try {
+                const response = await fetch(`/api/portfolios/${id}`);
+                const portfolio = await response.json();
+
+                document.getElementById('portfolioEmpty').style.display = 'none';
+                document.getElementById('portfolioDetail').style.display = 'block';
+
+                document.getElementById('detailPortfolioName').textContent = portfolio.name;
+                document.getElementById('detailPortfolioAsset').textContent = portfolio.asset_code;
+                document.getElementById('detailQuantity').textContent = portfolio.current_quantity.toFixed(4);
+                document.getElementById('detailAvgCost').textContent = '$' + portfolio.avg_cost.toFixed(2);
+                document.getElementById('detailCurrentPrice').textContent = '$' + portfolio.current_price.toFixed(2);
+                document.getElementById('detailUnrealizedPnl').textContent = (portfolio.unrealized_pnl >= 0 ? '+' : '') + portfolio.unrealized_pnl.toFixed(2);
+                document.getElementById('detailUnrealizedPnl').className = 'metric-value ' + (portfolio.unrealized_pnl >= 0 ? 'positive' : 'negative');
+                document.getElementById('detailRealizedPnl').textContent = (portfolio.realized_pnl >= 0 ? '+' : '') + portfolio.realized_pnl.toFixed(2);
+                document.getElementById('detailRealizedPnl').className = 'metric-value ' + (portfolio.realized_pnl >= 0 ? 'positive' : 'negative');
+                document.getElementById('detailTotalReturn').textContent = (portfolio.total_return >= 0 ? '+' : '') + portfolio.total_return.toFixed(2) + '%';
+                document.getElementById('detailTotalReturn').className = 'metric-value ' + (portfolio.total_return >= 0 ? 'positive' : 'negative');
+
+                // 显示交易记录
+                const tradeList = document.getElementById('tradeList');
+                if (portfolio.trades && portfolio.trades.length > 0) {
+                    tradeList.innerHTML = portfolio.trades.map(t => `
+                        <div class="trade-item ${t.trade_type}">
+                            <div class="trade-info">
+                                <span class="trade-type ${t.trade_type}">${t.trade_type === 'buy' ? '买入' : '卖出'}</span>
+                                <span class="trade-date">${t.trade_date}</span>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-weight: 600;">$${t.price.toFixed(2)}</div>
+                                <div style="font-size: 12px; color: #666;">${t.quantity.toFixed(4)}</div>
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    tradeList.innerHTML = '<p style="text-align: center; color: #666; padding: 20px;">暂无交易记录</p>';
+                }
+
+                // 加载权益曲线
+                loadEquityCurve(id);
+
+                // 刷新列表选中状态
+                loadPortfolios();
+
+            } catch (error) {
+                log(`加载仓位详情失败: ${error.message}`, 'error');
+            }
+        }
+
+        async function loadEquityCurve(portfolioId) {
+            try {
+                const response = await fetch(`/api/portfolios/${portfolioId}/equity_curve`);
+                const result = await response.json();
+
+                const container = document.getElementById('equityChart');
+                if (!result.curve || result.curve.length === 0) {
+                    container.innerHTML = '<p style="color: #666;">暂无权益数据</p>';
+                    return;
+                }
+
+                // 简单的SVG权益曲线
+                const width = container.clientWidth || 600;
+                const height = 300;
+                const padding = 40;
+
+                const values = result.curve.map(d => d.equity);
+                const minVal = Math.min(...values);
+                const maxVal = Math.max(...values);
+                const range = maxVal - minVal || 1;
+
+                const points = result.curve.map((d, i) => {
+                    const x = padding + (i / (result.curve.length - 1)) * (width - 2 * padding);
+                    const y = height - padding - ((d.equity - minVal) / range) * (height - 2 * padding);
+                    return `${x},${y}`;
+                }).join(' ');
+
+                const startVal = values[0];
+                const endVal = values[values.length - 1];
+                const color = endVal >= startVal ? '#27ae60' : '#e74c3c';
+
+                container.innerHTML = `
+                    <svg width="${width}" height="${height}" style="width: 100%; height: 100%;">
+                        <polyline points="${points}" fill="none" stroke="${color}" stroke-width="2"/>
+                        <text x="${padding}" y="${padding - 10}" font-size="12" fill="#666">$${maxVal.toFixed(0)}</text>
+                        <text x="${padding}" y="${height - padding + 20}" font-size="12" fill="#666">$${minVal.toFixed(0)}</text>
+                        <text x="${width - padding}" y="${height - padding + 20}" font-size="12" fill="#666" text-anchor="end">${result.curve.length}天</text>
+                    </svg>
+                `;
+
+            } catch (error) {
+                document.getElementById('equityChart').innerHTML = '<p style="color: #e74c3c;">加载失败</p>';
+            }
+        }
+
+        // ============== 模态框操作 ==============
+        function openPortfolioModal() {
+            document.getElementById('portfolioModal').classList.add('show');
+        }
+
+        function closePortfolioModal() {
+            document.getElementById('portfolioModal').classList.remove('show');
+        }
+
+        function openTradeModal() {
+            document.getElementById('tradeModal').classList.add('show');
+        }
+
+        function closeTradeModal() {
+            document.getElementById('tradeModal').classList.remove('show');
+        }
+
+        async function createPortfolio() {
+            const name = document.getElementById('newPortfolioName').value;
+            const asset = document.getElementById('newPortfolioAsset').value;
+            const capital = document.getElementById('newPortfolioCapital').value;
+            const mode = document.getElementById('newPortfolioMode').value;
+            const strategy = mode === 'strategy' ? document.getElementById('newPortfolioStrategy').value : null;
+
+            if (!name) {
+                alert('请输入仓位名称');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/portfolios', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name,
+                        asset_code: asset,
+                        initial_capital: parseFloat(capital),
+                        mode,
+                        strategy
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+
+                log(`仓位 "${name}" 创建成功`, 'success');
+                closePortfolioModal();
+                loadPortfolios();
+
+                // 清空表单
+                document.getElementById('newPortfolioName').value = '';
+
+            } catch (error) {
+                alert('创建失败: ' + error.message);
+            }
+        }
+
+        async function addTrade() {
+            if (!currentPortfolioId) {
+                alert('请先选择仓位');
+                return;
+            }
+
+            const type = document.getElementById('tradeType').value;
+            const date = document.getElementById('tradeDate').value;
+            const price = document.getElementById('tradePrice').value;
+            const quantity = document.getElementById('tradeQuantity').value;
+            const fee = document.getElementById('tradeFee').value;
+            const note = document.getElementById('tradeNote').value;
+
+            if (!date || !price || !quantity) {
+                alert('请填写完整交易信息');
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/portfolios/${currentPortfolioId}/trades`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        trade_date: date,
+                        trade_type: type,
+                        price: parseFloat(price),
+                        quantity: parseFloat(quantity),
+                        fee: parseFloat(fee) || 0,
+                        note
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+
+                log('交易记录已添加', 'success');
+                closeTradeModal();
+                selectPortfolio(currentPortfolioId); // 刷新详情
+
+                // 清空表单
+                document.getElementById('tradePrice').value = '';
+                document.getElementById('tradeQuantity').value = '';
+
+            } catch (error) {
+                alert('添加失败: ' + error.message);
+            }
+        }
+
+        async function deletePortfolio() {
+            if (!currentPortfolioId) return;
+
+            if (!confirm('确定要删除这个仓位吗？所有交易记录也将被删除。')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/portfolios/${currentPortfolioId}`, {
+                    method: 'DELETE'
+                });
+
+                const result = await response.json();
+
+                if (result.error) {
+                    throw new Error(result.error);
+                }
+
+                log('仓位已删除', 'success');
+                currentPortfolioId = null;
+                document.getElementById('portfolioDetail').style.display = 'none';
+                document.getElementById('portfolioEmpty').style.display = 'block';
+                loadPortfolios();
+
+            } catch (error) {
+                alert('删除失败: ' + error.message);
+            }
+        }
+
+        // 策略模式选择变化
+        document.getElementById('newPortfolioMode')?.addEventListener('change', function() {
+            document.getElementById('strategySelectGroup').style.display = this.value === 'strategy' ? 'block' : 'none';
+        });
+
         // ============== 工具函数 ==============
         function showLoading(show) {
-            document.getElementById('loading').classList.toggle('show', show);
+            const loading = document.getElementById('loading');
+            if (show) loading.classList.add('show');
+            else loading.classList.remove('show');
         }
 
         function log(message, type = 'info') {
@@ -2407,12 +3832,6 @@ HTML_TEMPLATE = '''
                 container.removeChild(container.lastChild);
             }
         }
-
-        // 初始化结束日期为今天
-        document.addEventListener('DOMContentLoaded', function() {
-            const today = new Date().toISOString().split('T')[0];
-            document.getElementById('backtestEndDate').value = today;
-        });
     </script>
 </body>
 </html>

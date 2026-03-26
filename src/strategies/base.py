@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 import pandas as pd
+import numpy as np
 from datetime import datetime
 
 
@@ -95,10 +96,16 @@ class BacktestResult:
 
     # 详细数据
     predictions: List[Dict] = None  # 每个预测点的详细结果
+    position_history: List[Dict] = None  # 仓位历史记录
+    trades: List[Any] = None  # 交易记录
 
     def __post_init__(self):
         if self.predictions is None:
             self.predictions = []
+        if self.position_history is None:
+            self.position_history = []
+        if self.trades is None:
+            self.trades = []
 
 
 class PredictionStrategy(ABC):
@@ -152,18 +159,13 @@ class PredictionStrategy(ABC):
         if df is None or df.empty:
             return False
 
-        # 数据库可能使用不同的列名
-        required_columns = [
-            ['open_price', 'close_price'],
-            ['max_price', 'min_price']  # 或者 high_price, low_price
-        ]
+        # 至少需要有 close_price 列
+        if 'close_price' not in df.columns:
+            return False
 
-        for col_group in required_columns:
-            for col in col_group:
-                if col not in df.columns:
-                    return False
-
-        return True
+        # 检查 close_price 是否有有效数据
+        if df['close_price'].isna().all():
+            return False
 
         return True
 
@@ -178,8 +180,6 @@ class PredictionStrategy(ABC):
             Dict: 技术指标字典
         """
         close = df['close_price']
-        high = df['max_price'] if 'max_price' in df.columns else df['high_price']
-        low = df['min_price'] if 'min_price' in df.columns else df['low_price']
 
         signals = {}
 
@@ -191,13 +191,14 @@ class PredictionStrategy(ABC):
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
+        # 避免除以零
+        rs = gain / loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
-        signals['RSI'] = rsi.iloc[-1] if not rsi.empty else None
+        signals['RSI'] = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
 
         # 波动率
         returns = close.pct_change().dropna()
-        signals['volatility'] = returns.std() * (365 ** 0.5) if len(returns) > 0 else None
+        signals['volatility'] = returns.std() * (365 ** 0.5) if len(returns) > 0 else 0
 
         # 趋势
         if signals['MA7'] is not None and signals['MA30'] is not None:

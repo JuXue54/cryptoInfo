@@ -7,12 +7,14 @@
 - MeanReversionStrategy: 均值回归策略
 - EnsembleStrategy: 策略组合器
 - RegimeAwareStrategy: 状态感知策略
+- LSTMStrategy: LSTM深度学习预测策略
 """
 from .base import PredictionStrategy, StrategyResult
 from .monte_carlo import MonteCarloStrategy
 from .trend_following import TrendFollowingStrategy
 from .mean_reversion import MeanReversionStrategy
 from .ensemble import EnsembleStrategy, RegimeAwareStrategy
+from .ml_strategy import LSTMStrategy, MLStrategyBase, FeatureExtractor
 
 __all__ = [
     'PredictionStrategy', 'StrategyResult',
@@ -20,5 +22,8 @@ __all__ = [
     'TrendFollowingStrategy',
     'MeanReversionStrategy',
     'EnsembleStrategy',
-    'RegimeAwareStrategy'
+    'RegimeAwareStrategy',
+    'LSTMStrategy',
+    'MLStrategyBase',
+    'FeatureExtractor'
 ]
