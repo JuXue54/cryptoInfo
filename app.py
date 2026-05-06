@@ -3,10 +3,15 @@
 加密货币追踪工具 - Web后端API
 使用Flask提供REST API服务
 """
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, stream_with_context
 from flask_cors import CORS
 import os
 import json
+import glob
+import uuid
+import threading
+import queue
+import time
 from datetime import datetime
 
 from config import SUPPORTED_ASSETS, DEFAULT_CURRENCY, MA_PERIODS
@@ -34,6 +39,232 @@ CORS(app)
 
 db = Database()
 fetcher = DataFetcher()
+
+# ============== 模型训练状态管理 ==============
+training_jobs = {}
+training_lock = threading.Lock()
+
+# 最大保留历史任务数
+MAX_HISTORY_JOBS = 10
+
+
+def get_available_models():
+    """获取已训练的模型列表（支持多模型）"""
+    models = []
+    models_dir = 'models'
+    if not os.path.exists(models_dir):
+        return models
+
+    # 新模式：支持 {asset}_{model_id}_lstm_best.pth 格式
+    import glob
+    pattern = f"{models_dir}/*_lstm_best.pth"
+    best_models = glob.glob(pattern)
+
+    # 按asset分组
+    models_by_asset = {}
+    for best_path in best_models:
+        filename = os.path.basename(best_path)
+        # 解析文件名: {asset}_{model_id}_lstm_best.pth 或 {asset}_lstm_best.pth
+        parts = filename.replace('_lstm_best.pth', '').split('_')
+
+        if len(parts) >= 2:
+            asset = parts[0].upper()
+            model_id = '_'.join(parts[1:]) if len(parts) > 1 else 'default'
+        else:
+            asset = parts[0].upper() if parts else 'UNKNOWN'
+            model_id = 'default'
+
+        if asset not in models_by_asset:
+            models_by_asset[asset] = []
+
+        # 获取对应的final模型和历史文件
+        final_path = best_path.replace('_best.pth', '.pth')
+        history_path = best_path.replace('_best.pth', '_history.json')
+
+        model_info = {
+            'asset': asset,
+            'model_id': model_id,
+            'best_model': {
+                'path': best_path,
+                'mtime': datetime.fromtimestamp(os.path.getmtime(best_path)).isoformat(),
+                'type': 'best'
+            },
+            'final_model': None,
+            'history': None
+        }
+
+        # 加载training_info获取详细配置
+        try:
+            import torch
+            checkpoint = torch.load(best_path, map_location='cpu')
+            training_info = checkpoint.get('training_info', {})
+            config = checkpoint.get('config', {})
+            model_info['training_info'] = training_info
+            model_info['config'] = config
+        except Exception as e:
+            model_info['training_info'] = {}
+            model_info['config'] = {}
+
+        if os.path.exists(final_path):
+            model_info['final_model'] = {
+                'path': final_path,
+                'mtime': datetime.fromtimestamp(os.path.getmtime(final_path)).isoformat(),
+                'type': 'final'
+            }
+        if os.path.exists(history_path):
+            try:
+                with open(history_path, 'r') as f:
+                    model_info['history'] = json.load(f)
+            except Exception:
+                pass
+
+        models_by_asset[asset].append(model_info)
+
+    # 转换为列表格式
+    for asset, model_list in models_by_asset.items():
+        models.append({
+            'asset': asset,
+            'models': model_list
+        })
+
+    return models
+
+    return models
+
+
+def get_lstm_model_path(asset_code, prefer_best=True):
+    """获取LSTM模型路径，优先返回最佳模型"""
+    best_path = f"models/{asset_code.lower()}_lstm_best.pth"
+    final_path = f"models/{asset_code.lower()}_lstm.pth"
+
+    if prefer_best and os.path.exists(best_path):
+        return best_path
+    if os.path.exists(final_path):
+        return final_path
+    return None
+
+
+def cleanup_old_jobs(locked=False):
+    """清理过多的已完成历史任务
+
+    Args:
+        locked: 如果为True，表示调用者已经持有training_lock
+    """
+    def _do_cleanup():
+        completed = [(jid, job) for jid, job in training_jobs.items()
+                     if job.get('status') in ('completed', 'failed', 'stopped')]
+        if len(completed) > MAX_HISTORY_JOBS:
+            completed.sort(key=lambda x: x[1].get('finished_at', ''), reverse=True)
+            for jid, _ in completed[MAX_HISTORY_JOBS:]:
+                training_jobs.pop(jid, None)
+
+    if locked:
+        _do_cleanup()
+    else:
+        with training_lock:
+            _do_cleanup()
+
+
+def start_training_job(asset_code, epochs, lr, resume=False, model_id='default',
+                       hidden_size=64, num_layers=1, dropout=0.4,
+                       batch_size=128, seq_len=60, forecast_horizon=7, patience=10):
+    """在后台线程启动训练任务"""
+    job_id = str(uuid.uuid4())
+    progress_queue = queue.Queue()
+
+    job = {
+        'id': job_id,
+        'asset': asset_code,
+        'model_id': model_id,
+        'epochs': epochs,
+        'lr': lr,
+        'hidden_size': hidden_size,
+        'num_layers': num_layers,
+        'dropout': dropout,
+        'batch_size': batch_size,
+        'seq_len': seq_len,
+        'forecast_horizon': forecast_horizon,
+        'patience': patience,
+        'resume': resume,
+        'status': 'running',
+        'started_at': datetime.now().isoformat(),
+        'finished_at': None,
+        'progress': {
+            'epoch': 0,
+            'total_epochs': epochs,
+            'train_loss': None,
+            'val_loss': None,
+            'train_acc': None,
+            'val_acc': None,
+            'best_val_loss': None,
+            'message': '准备训练数据...'
+        },
+        'history': [],
+        'result': None,
+        'error': None,
+        'queue': progress_queue
+    }
+
+    with training_lock:
+        training_jobs[job_id] = job
+        cleanup_old_jobs(locked=True)
+
+    def progress_callback(data):
+        progress_queue.put(data)
+
+    def run_training():
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(__file__))
+            from scripts.train_model import train_model
+
+            # 更新状态：数据准备中
+            progress_queue.put({'message': '正在准备训练数据...', 'epoch': 0, 'total_epochs': epochs})
+
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+            final_model_path, best_model_path, history = train_model(
+                asset_code=asset_code,
+                model_id=model_id,
+                epochs=epochs,
+                lr=lr,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                forecast_horizon=forecast_horizon,
+                patience=patience,
+                device=device,
+                resume=resume,
+                checkpoint_interval=1,
+                progress_callback=progress_callback
+            )
+
+            job['result'] = {
+                'final_model': final_model_path,
+                'best_model': best_model_path,
+                'total_epochs': history.get('train_loss', []).__len__()
+            }
+            job['status'] = 'completed'
+        except Exception as e:
+            import traceback
+            job['error'] = str(e)
+            job['traceback'] = traceback.format_exc()
+            job['status'] = 'failed'
+            progress_queue.put({'message': f'训练失败: {e}', 'epoch': 0, 'total_epochs': epochs, 'error': True})
+        finally:
+            job['finished_at'] = datetime.now().isoformat()
+            progress_queue.put({'done': True})
+
+    thread = threading.Thread(target=run_training, daemon=True)
+    thread.start()
+
+    return job_id
+
+
+# 导入 torch 用于设备检测
+import torch
 
 # ============== API 路由 ==============
 
@@ -254,6 +485,10 @@ def predict_asset(asset_code):
             import json
             strategy_params = json.loads(strategy_params)
 
+        model_path = request.args.get('model_path')
+        if model_path:
+            strategy_params['model_path'] = model_path
+
         # 获取历史数据
         df = db.get_price_data(asset_code, DEFAULT_CURRENCY)
 
@@ -400,7 +635,12 @@ def create_strategy(strategy_name: str, params: dict):
             adx_threshold=params.get('adx_threshold', 25)
         )
     elif strategy_name == 'lstm':
+        asset_code = params.get('asset_code', 'BTC')
+        model_path = params.get('model_path')
+        if not model_path:
+            model_path = get_lstm_model_path(asset_code, prefer_best=True)
         return LSTMStrategy(
+            model_path=model_path,
             seq_len=params.get('seq_len', 60),
             hidden_size=params.get('hidden_size', 128),
             num_layers=params.get('num_layers', 2)
@@ -426,6 +666,9 @@ def backtest_asset(asset_code):
         forecast_days = int(data.get('forecast_days', 7))
         step_days = int(data.get('step_days', 7))
         strategy_params = data.get('strategy_params', {})
+        model_path = data.get('model_path')
+        if model_path:
+            strategy_params['model_path'] = model_path
         engine_type = data.get('engine', 'standard')  # 'standard' or 'enhanced'
 
         # 增强引擎参数
@@ -784,6 +1027,178 @@ def backtest_compare_chart(asset_code):
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
+
+# ============== 模型训练 API ==============
+
+@app.route('/api/train/models')
+def list_models():
+    """获取已训练的模型列表"""
+    return jsonify({'models': get_available_models()})
+
+
+@app.route('/api/train/jobs')
+def list_training_jobs():
+    """获取训练任务列表"""
+    with training_lock:
+        jobs = []
+        for job in training_jobs.values():
+            job_summary = {
+                'id': job['id'],
+                'asset': job['asset'],
+                'epochs': job['epochs'],
+                'lr': job['lr'],
+                'status': job['status'],
+                'started_at': job['started_at'],
+                'finished_at': job['finished_at'],
+                'progress': job['progress'],
+                'result': job.get('result'),
+                'error': job.get('error')
+            }
+            jobs.append(job_summary)
+    return jsonify({'jobs': jobs})
+
+
+@app.route('/api/train/start', methods=['POST'])
+def start_train():
+    """启动模型训练任务"""
+    data = request.get_json() or {}
+    asset_code = data.get('asset', 'BTC').upper()
+    model_id = data.get('model_id', 'default')
+    epochs = int(data.get('epochs', 50))
+    lr = float(data.get('lr', 0.001))
+    hidden_size = int(data.get('hidden_size', 128))
+    num_layers = int(data.get('num_layers', 2))
+    dropout = float(data.get('dropout', 0.2))
+    batch_size = int(data.get('batch_size', 32))
+    seq_len = int(data.get('seq_len', 60))
+    forecast_horizon = int(data.get('forecast_horizon', 7))
+    patience = int(data.get('patience', 10))
+    resume = bool(data.get('resume', False))
+
+    if asset_code not in SUPPORTED_ASSETS:
+        return jsonify({'error': 'Unsupported asset'}), 400
+
+    # 验证模型ID格式（只允许字母数字下划线）
+    if not model_id or not all(c.isalnum() or c == '_' for c in model_id):
+        return jsonify({'error': '模型ID只能包含字母、数字和下划线'}), 400
+
+    # 检查是否已有同资产+同模型正在运行的任务
+    with training_lock:
+        for job in training_jobs.values():
+            if job['asset'] == asset_code and job.get('model_id') == model_id and job['status'] == 'running':
+                return jsonify({
+                    'error': f'已有 {asset_code}/{model_id} 的训练任务正在运行',
+                    'job_id': job['id']
+                }), 409
+
+    job_id = start_training_job(
+        asset_code=asset_code,
+        model_id=model_id,
+        epochs=epochs,
+        lr=lr,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        forecast_horizon=forecast_horizon,
+        patience=patience,
+        resume=resume
+    )
+    return jsonify({
+        'job_id': job_id,
+        'message': f'{asset_code}/{model_id} 模型训练已启动',
+        'asset': asset_code,
+        'model_id': model_id,
+        'epochs': epochs
+    })
+
+
+@app.route('/api/train/history/<asset_code>/<model_id>')
+def get_training_history(asset_code, model_id):
+    """获取指定模型的训练历史"""
+    history_path = f'models/{asset_code.lower()}_{model_id}_lstm_history.json'
+
+    if not os.path.exists(history_path):
+        return jsonify({'error': '训练历史不存在'}), 404
+
+    try:
+        with open(history_path, 'r') as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/train/progress/<job_id>')
+def train_progress(job_id):
+    """SSE 流式返回训练进度"""
+    def event_stream():
+        job = None
+        with training_lock:
+            job = training_jobs.get(job_id)
+
+        if not job:
+            yield 'event: error\ndata: {"message": "任务不存在"}\n\n'
+            return
+
+        q = job['queue']
+
+        while True:
+            try:
+                data = q.get(timeout=30)
+
+                if data.get('done'):
+                    with training_lock:
+                        j = training_jobs.get(job_id, {})
+                        result = {
+                            'status': j.get('status'),
+                            'result': j.get('result'),
+                            'error': j.get('error')
+                        }
+                    yield f'event: complete\ndata: {json.dumps(result)}\n\n'
+                    break
+
+                if data.get('error'):
+                    yield f'event: error\ndata: {json.dumps(data)}\n\n'
+                    break
+
+                # 更新全局进度
+                with training_lock:
+                    if job_id in training_jobs:
+                        training_jobs[job_id]['progress'].update(data)
+                        if 'epoch' in data and data['epoch'] > 0:
+                            training_jobs[job_id]['history'].append(data)
+
+                yield f'data: {json.dumps(data)}\n\n'
+
+            except queue.Empty:
+                # 发送心跳保持连接
+                yield ':heartbeat\n\n'
+                continue
+            except Exception as e:
+                yield f'event: error\ndata: {{"message": "{str(e)}"}}\n\n'
+                break
+
+    return stream_with_context(event_stream()), {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    }
+
+
+@app.route('/api/train/jobs/<job_id>', methods=['DELETE'])
+def delete_training_job(job_id):
+    """删除训练任务记录（不会停止正在运行的线程，仅移除记录）"""
+    with training_lock:
+        if job_id in training_jobs:
+            training_jobs.pop(job_id, None)
+            return jsonify({'message': '任务记录已删除'})
+    return jsonify({'error': '任务不存在'}), 404
+
+
+# ============== 回测分析 API ==============
 
 @app.route('/api/backtest/<asset_code>/analyze', methods=['POST'])
 def analyze_backtest(asset_code):
@@ -1283,6 +1698,7 @@ HTML_TEMPLATE = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>加密货币分析工具</title>
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -2182,6 +2598,10 @@ HTML_TEMPLATE = '''
                     <span class="nav-icon">📈</span>
                     <span>策略回测</span>
                 </div>
+                <div class="nav-item" onclick="switchPanel('training')">
+                    <span class="nav-icon">🧠</span>
+                    <span>模型训练</span>
+                </div>
                 <div class="nav-item" onclick="switchPanel('portfolio')">
                     <span class="nav-icon">💼</span>
                     <span>仓位管理</span>
@@ -2326,13 +2746,19 @@ HTML_TEMPLATE = '''
                         </div>
                         <div class="control-group">
                             <label>策略:</label>
-                            <select id="predictionStrategy">
+                            <select id="predictionStrategy" onchange="onPredStrategyChange()">
                                 <option value="monte_carlo">蒙特卡洛模拟</option>
                                 <option value="trend_following">趋势跟踪</option>
                                 <option value="mean_reversion">均值回归</option>
                                 <option value="ensemble">策略组合</option>
                                 <option value="regime_aware">状态感知</option>
                                 <option value="lstm">LSTM深度学习</option>
+                            </select>
+                        </div>
+                        <div class="control-group" id="predModelGroup" style="display: none;">
+                            <label>LSTM模型:</label>
+                            <select id="predModelSelect">
+                                <option value="">自动选择最佳模型</option>
                             </select>
                         </div>
                         <button onclick="runPrediction()" id="predictBtn" style="background: #e74c3c;">运行预测</button>
@@ -2407,13 +2833,19 @@ HTML_TEMPLATE = '''
                         </div>
                         <div class="control-group">
                             <label>策略:</label>
-                            <select id="backtestStrategy">
+                            <select id="backtestStrategy" onchange="onBacktestStrategyChange()">
                                 <option value="monte_carlo">蒙特卡洛模拟</option>
                                 <option value="trend_following" selected>趋势跟踪</option>
                                 <option value="mean_reversion">均值回归</option>
                                 <option value="ensemble">策略组合</option>
                                 <option value="regime_aware">状态感知</option>
                                 <option value="lstm">LSTM深度学习</option>
+                            </select>
+                        </div>
+                        <div class="control-group" id="backtestModelGroup" style="display: none;">
+                            <label>LSTM模型:</label>
+                            <select id="backtestModelSelect">
+                                <option value="">自动选择最佳模型</option>
                             </select>
                         </div>
                     </div>
@@ -2602,6 +3034,176 @@ HTML_TEMPLATE = '''
                     <div class="card">
                         <h3 style="margin-bottom: 16px; font-size: 16px;">仓位变化时间线</h3>
                         <div id="positionTimeline" class="position-timeline"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== 模型训练面板 ========== -->
+            <div id="trainingPanel" class="panel">
+                <div class="panel-header">
+                    <h2>模型训练</h2>
+                    <p>训练LSTM深度学习模型，实时查看训练进度</p>
+                </div>
+
+                <div class="card">
+                    <h3 style="margin-bottom: 16px; font-size: 16px;">训练配置</h3>
+                    <div class="control-row" style="flex-wrap: wrap; gap: 12px;">
+                        <div class="control-group">
+                            <label>币种:</label>
+                            <select id="trainAssetSelect">
+                                <option value="BTC">Bitcoin (BTC)</option>
+                                <option value="ETH">Ethereum (ETH)</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>模型ID:</label>
+                            <input type="text" id="trainModelId" value="default" placeholder="输入模型标识" style="width: 120px;">
+                        </div>
+                        <div class="control-group">
+                            <label>训练轮数:</label>
+                            <select id="trainEpochs">
+                                <option value="10">10轮</option>
+                                <option value="30">30轮</option>
+                                <option value="50" selected>50轮</option>
+                                <option value="100">100轮</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>学习率:</label>
+                            <select id="trainLR">
+                                <option value="0.0001">0.0001</option>
+                                <option value="0.0005">0.0005</option>
+                                <option value="0.001" selected>0.001</option>
+                                <option value="0.005">0.005</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>隐藏层:</label>
+                            <select id="trainHiddenSize">
+                                <option value="64">64</option>
+                                <option value="128" selected>128</option>
+                                <option value="256">256</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>LSTM层数:</label>
+                            <select id="trainNumLayers">
+                                <option value="1">1层</option>
+                                <option value="2" selected>2层</option>
+                                <option value="3">3层</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>Dropout:</label>
+                            <select id="trainDropout">
+                                <option value="0.1">0.1</option>
+                                <option value="0.2" selected>0.2</option>
+                                <option value="0.3">0.3</option>
+                                <option value="0.5">0.5</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>Batch Size:</label>
+                            <select id="trainBatchSize">
+                                <option value="16">16</option>
+                                <option value="32" selected>32</option>
+                                <option value="64">64</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>序列长度:</label>
+                            <select id="trainSeqLen">
+                                <option value="30">30</option>
+                                <option value="60" selected>60</option>
+                                <option value="90">90</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>预测天数:</label>
+                            <select id="trainForecastHorizon">
+                                <option value="1">1天</option>
+                                <option value="3">3天</option>
+                                <option value="7" selected>7天</option>
+                                <option value="14">14天</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>早停耐心:</label>
+                            <select id="trainPatience">
+                                <option value="5">5轮</option>
+                                <option value="10" selected>10轮</option>
+                                <option value="15">15轮</option>
+                                <option value="20">20轮</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>
+                                <input type="checkbox" id="trainResume" style="width: 18px; height: 18px;"> 断点续训
+                            </label>
+                        </div>
+                        <button onclick="startTraining()" id="startTrainBtn" style="background: #e74c3c;">开始训练</button>
+                    </div>
+                </div>
+
+                <!-- 训练进度 -->
+                <div id="trainingProgressCard" class="card" style="display: none;">
+                    <h3 style="margin-bottom: 16px; font-size: 16px;">训练进度</h3>
+                    <div style="margin-bottom: 12px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                            <span id="trainProgressText">准备中...</span>
+                            <span id="trainEpochDisplay">0 / 50</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="trainProgressBar" style="width: 0%;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Loss曲线图表 -->
+                    <div style="margin: 20px 0; height: 300px;">
+                        <canvas id="trainingChart"></canvas>
+                    </div>
+
+                    <div class="backtest-metrics" style="margin-bottom: 0;">
+                        <div class="metric-card">
+                            <h5>训练损失</h5>
+                            <div class="metric-value" id="trainLossValue">-</div>
+                        </div>
+                        <div class="metric-card">
+                            <h5>验证损失</h5>
+                            <div class="metric-value" id="valLossValue">-</div>
+                        </div>
+                        <div class="metric-card">
+                            <h5>训练准确率</h5>
+                            <div class="metric-value" id="trainAccValue">-</div>
+                        </div>
+                        <div class="metric-card">
+                            <h5>验证准确率</h5>
+                            <div class="metric-value" id="valAccValue">-</div>
+                        </div>
+                        <div class="metric-card">
+                            <h5>最佳验证损失</h5>
+                            <div class="metric-value" id="bestValLossValue">-</div>
+                        </div>
+                        <div class="metric-card">
+                            <h5>学习率</h5>
+                            <div class="metric-value" id="trainLRValue">-</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 已训练模型 -->
+                <div class="card">
+                    <h3 style="margin-bottom: 16px; font-size: 16px;">已训练模型</h3>
+                    <div id="modelsList">
+                        <p style="text-align: center; color: #666; padding: 20px;">正在加载...</p>
+                    </div>
+                </div>
+
+                <!-- 训练历史任务 -->
+                <div class="card">
+                    <h3 style="margin-bottom: 16px; font-size: 16px;">训练任务历史</h3>
+                    <div id="jobsList">
+                        <p style="text-align: center; color: #666; padding: 20px;">正在加载...</p>
                     </div>
                 </div>
             </div>
@@ -2841,6 +3443,9 @@ HTML_TEMPLATE = '''
             // 面板特定初始化
             if (panelName === 'portfolio') {
                 loadPortfolios();
+            } else if (panelName === 'training') {
+                loadModels();
+                loadJobs();
             }
         }
 
@@ -3197,6 +3802,7 @@ HTML_TEMPLATE = '''
             const forecastDays = document.getElementById('forecastDays').value;
             const simulations = document.getElementById('simulationCount').value;
             const strategy = document.getElementById('predictionStrategy').value;
+            const modelPath = strategy === 'lstm' ? document.getElementById('predModelSelect').value : '';
 
             btn.disabled = true;
             resultDiv.style.display = 'none';
@@ -3206,9 +3812,9 @@ HTML_TEMPLATE = '''
 
             try {
                 // 先获取预测数据
-                const response = await fetch(
-                    `/api/predict/${asset}?days=${forecastDays}&simulations=${simulations}&strategy=${strategy}`
-                );
+                let predUrl = `/api/predict/${asset}?days=${forecastDays}&simulations=${simulations}&strategy=${strategy}`;
+                if (modelPath) predUrl += `&model_path=${encodeURIComponent(modelPath)}`;
+                const response = await fetch(predUrl);
                 const result = await response.json();
 
                 if (result.error) {
@@ -3272,6 +3878,7 @@ HTML_TEMPLATE = '''
             const forecastDays = document.getElementById('backtestForecastDays').value;
             const stepDays = document.getElementById('backtestStepDays').value;
             const strategy = document.getElementById('backtestStrategy').value;
+            const modelPath = strategy === 'lstm' ? document.getElementById('backtestModelSelect').value : '';
             const initialCapital = document.getElementById('backtestInitialCapital').value;
             const positionSize = document.getElementById('backtestPositionSize').value / 100;
             const stopLoss = document.getElementById('stopLossPct').value;
@@ -3296,6 +3903,7 @@ HTML_TEMPLATE = '''
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         strategy: strategy,
+                        model_path: modelPath || undefined,
                         start_date: startDate,
                         end_date: endDate,
                         forecast_days: parseInt(forecastDays),
@@ -3830,6 +4438,495 @@ HTML_TEMPLATE = '''
             // 限制日志条数
             while (container.children.length > 50) {
                 container.removeChild(container.lastChild);
+            }
+        }
+
+        // ============== 模型训练面板 ==============
+        function onPredStrategyChange() {
+            const strategy = document.getElementById('predictionStrategy').value;
+            const modelGroup = document.getElementById('predModelGroup');
+            if (strategy === 'lstm') {
+                modelGroup.style.display = 'block';
+                loadModelsForSelect('predModelSelect');
+            } else {
+                modelGroup.style.display = 'none';
+            }
+        }
+
+        function onBacktestStrategyChange() {
+            const strategy = document.getElementById('backtestStrategy').value;
+            const modelGroup = document.getElementById('backtestModelGroup');
+            if (strategy === 'lstm') {
+                modelGroup.style.display = 'block';
+                loadModelsForSelect('backtestModelSelect');
+            } else {
+                modelGroup.style.display = 'none';
+            }
+        }
+
+        async function loadModelsForSelect(selectId) {
+            try {
+                const response = await fetch('/api/train/models');
+                const data = await response.json();
+                const select = document.getElementById(selectId);
+                const currentVal = select.value;
+                select.innerHTML = '<option value="">自动选择最佳模型</option>';
+                (data.models || []).forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.path;
+                    opt.textContent = `${m.asset} - ${m.filename} (${m.updated_at})`;
+                    select.appendChild(opt);
+                });
+                if (currentVal) select.value = currentVal;
+            } catch (e) {
+                console.error('加载模型失败', e);
+            }
+        }
+
+        async function loadModels() {
+            const list = document.getElementById('modelsList');
+            try {
+                const response = await fetch('/api/train/models');
+                const data = await response.json();
+                const models = data.models || [];
+                if (models.length === 0) {
+                    list.innerHTML = '<p style="text-align: center; color: #666; padding: 20px;">暂无已训练模型</p>';
+                    return;
+                }
+
+                let html = '<div style="display: grid; gap: 12px;">';
+                models.forEach(group => {
+                    html += `<div style="border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">`;
+                    html += `<div style="background: #f5f5f5; padding: 10px 16px; font-weight: bold; font-size: 16px;">${group.asset}</div>`;
+                    html += `<div style="padding: 12px;">`;
+
+                    group.models.forEach(m => {
+                        const config = m.config || {};
+                        const training_info = m.training_info || {};
+                        const bestLoss = training_info.best_val_loss ? training_info.best_val_loss.toFixed(4) : '-';
+                        const bestEpoch = training_info.best_epoch || '-';
+
+                        html += `<div style="border: 1px solid #eee; border-radius: 6px; padding: 12px; margin-bottom: 10px; background: white;">`;
+                        html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">`;
+                        html += `<strong style="font-size: 15px;">🤖 ${m.model_id}</strong>`;
+                        html += `<span style="font-size: 12px; color: #666;">${m.best_model ? new Date(m.best_model.mtime).toLocaleString() : '-'}</span>`;
+                        html += `</div>`;
+
+                        html += `<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 8px; font-size: 12px; color: #555; margin-bottom: 10px;">`;
+                        html += `<div>隐藏层: <strong>${config.hidden_size || '-'}</strong></div>`;
+                        html += `<div>层数: <strong>${config.num_layers || '-'}</strong></div>`;
+                        html += `<div>Dropout: <strong>${config.dropout || '-'}</strong></div>`;
+                        html += `<div>Batch: <strong>${config.batch_size || '-'}</strong></div>`;
+                        html += `<div>序列: <strong>${config.seq_len || '-'}</strong></div>`;
+                        html += `<div>预测: <strong>${config.forecast_horizon || '-'}天</strong></div>`;
+                        html += `</div>`;
+
+                        html += `<div style="display: flex; gap: 16px; font-size: 13px;">`;
+                        html += `<span>🏆 最佳Loss: <strong style="color: #27ae60;">${bestLoss}</strong></span>`;
+                        html += `<span>📈 最佳轮数: <strong>${bestEpoch}</strong></span>`;
+                        html += `</div>`;
+
+                        if (m.history && m.history.history) {
+                            html += `<div style="margin-top: 10px;"><button onclick="showTrainingHistory('${group.asset}', '${m.model_id}')" style="padding: 4px 12px; font-size: 12px;">📊 查看历史曲线</button></div>`;
+                        }
+
+                        html += `</div>`;
+                    });
+
+                    html += `</div></div>`;
+                });
+                html += '</div>';
+                list.innerHTML = html;
+            } catch (e) {
+                console.error('加载模型失败:', e);
+                list.innerHTML = '<p style="text-align: center; color: #dc3545; padding: 20px;">加载模型失败</p>';
+            }
+        }
+
+        async function loadJobs() {
+            const list = document.getElementById('jobsList');
+            try {
+                const response = await fetch('/api/train/jobs');
+                const data = await response.json();
+                const jobs = data.jobs || [];
+                if (jobs.length === 0) {
+                    list.innerHTML = '<p style="text-align: center; color: #666; padding: 20px;">暂无训练任务</p>';
+                    return;
+                }
+                let html = '<table class="trades-table"><thead><tr><th>资产</th><th>轮数</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody>';
+                jobs.forEach(j => {
+                    const statusText = { running: '运行中', completed: '已完成', failed: '失败', stopped: '已停止' }[j.status] || j.status;
+                    let progress = '-';
+                    if (j.progress && j.progress.epoch) {
+                        progress = `第 ${j.progress.epoch} / ${j.progress.total_epochs} 轮`;
+                    }
+                    html += `<tr><td>${j.asset}</td><td>${j.epochs}</td><td>${statusText}</td><td>${progress}</td>`;
+                    html += `<td><button onclick="deleteJob('${j.id}')" class="danger" style="padding: 2px 8px; font-size: 12px;">删除</button></td></tr>`;
+                });
+                html += '</tbody></table>';
+                list.innerHTML = html;
+            } catch (e) {
+                list.innerHTML = '<p style="text-align: center; color: #dc3545; padding: 20px;">加载任务失败</p>';
+            }
+        }
+
+        async function deleteJob(jobId) {
+            if (!confirm('确定删除该训练任务记录？')) return;
+            try {
+                await fetch(`/api/train/jobs/${jobId}`, { method: 'DELETE' });
+                loadJobs();
+            } catch (e) {
+                alert('删除失败');
+            }
+        }
+
+        let trainingEventSource = null;
+
+        async function startTraining() {
+            const asset = document.getElementById('trainAssetSelect').value;
+            const model_id = document.getElementById('trainModelId').value.trim() || 'default';
+            const epochs = parseInt(document.getElementById('trainEpochs').value);
+            const lr = parseFloat(document.getElementById('trainLR').value);
+            const hidden_size = parseInt(document.getElementById('trainHiddenSize').value);
+            const num_layers = parseInt(document.getElementById('trainNumLayers').value);
+            const dropout = parseFloat(document.getElementById('trainDropout').value);
+            const batch_size = parseInt(document.getElementById('trainBatchSize').value);
+            const seq_len = parseInt(document.getElementById('trainSeqLen').value);
+            const forecast_horizon = parseInt(document.getElementById('trainForecastHorizon').value);
+            const patience = parseInt(document.getElementById('trainPatience').value);
+            const resume = document.getElementById('trainResume').checked;
+            const btn = document.getElementById('startTrainBtn');
+
+            btn.disabled = true;
+            btn.textContent = '启动中...';
+
+            try {
+                const response = await fetch('/api/train/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        asset,
+                        model_id,
+                        epochs,
+                        lr,
+                        hidden_size,
+                        num_layers,
+                        dropout,
+                        batch_size,
+                        seq_len,
+                        forecast_horizon,
+                        patience,
+                        resume
+                    })
+                });
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || '启动失败');
+                }
+
+                log(result.message, 'success');
+                connectTrainingProgress(result.job_id, epochs);
+                loadJobs();
+            } catch (error) {
+                log(`训练启动失败: ${error.message}`, 'error');
+                btn.disabled = false;
+                btn.textContent = '开始训练';
+            }
+        }
+
+        let trainingChart = null;
+
+        function connectTrainingProgress(jobId, totalEpochs) {
+            const progressCard = document.getElementById('trainingProgressCard');
+            progressCard.style.display = 'block';
+            document.getElementById('trainProgressText').textContent = '连接中...';
+            document.getElementById('trainProgressBar').style.width = '0%';
+            document.getElementById('trainEpochDisplay').textContent = `0 / ${totalEpochs}`;
+            document.getElementById('startTrainBtn').textContent = '训练中...';
+
+            // 初始化Chart.js图表
+            const ctx = document.getElementById('trainingChart').getContext('2d');
+            if (trainingChart) {
+                trainingChart.destroy();
+            }
+
+            trainingChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: '训练Loss',
+                            data: [],
+                            borderColor: '#3498db',
+                            backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                            borderWidth: 2,
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            yAxisID: 'y-loss',
+                            tension: 0.3
+                        },
+                        {
+                            label: '验证Loss',
+                            data: [],
+                            borderColor: '#e74c3c',
+                            backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                            borderWidth: 2,
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            yAxisID: 'y-loss',
+                            tension: 0.3
+                        },
+                        {
+                            label: '训练准确率',
+                            data: [],
+                            borderColor: '#27ae60',
+                            backgroundColor: 'rgba(39, 174, 96, 0.1)',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            yAxisID: 'y-acc',
+                            tension: 0.3
+                        },
+                        {
+                            label: '验证准确率',
+                            data: [],
+                            borderColor: '#f39c12',
+                            backgroundColor: 'rgba(243, 156, 18, 0.1)',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            pointRadius: 3,
+                            pointHoverRadius: 5,
+                            yAxisID: 'y-acc',
+                            tension: 0.3
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Loss与准确率曲线',
+                            font: { size: 14 }
+                        },
+                        legend: {
+                            position: 'top',
+                            labels: { usePointStyle: true, padding: 15 }
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.dataset.yAxisID === 'y-acc') {
+                                        label += context.parsed.y.toFixed(1) + '%';
+                                    } else {
+                                        label += context.parsed.y.toFixed(4);
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            title: { display: true, text: '轮数 (Epoch)' }
+                        },
+                        'y-loss': {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'Loss' },
+                            min: 0,
+                            max: 1
+                        },
+                        'y-acc': {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: '准确率 (%)' },
+                            min: 0,
+                            max: 100,
+                            grid: { drawOnChartArea: false }
+                        }
+                    },
+                    animation: { duration: 0 }
+                }
+            });
+
+            if (trainingEventSource) trainingEventSource.close();
+
+            trainingEventSource = new EventSource(`/api/train/progress/${jobId}`);
+
+            trainingEventSource.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if (data.epoch) {
+                    const pct = (data.epoch / data.total_epochs) * 100;
+                    document.getElementById('trainProgressBar').style.width = `${pct}%`;
+                    document.getElementById('trainEpochDisplay').textContent = `${data.epoch} / ${data.total_epochs}`;
+                    document.getElementById('trainProgressText').textContent = data.message || `训练中...`;
+                    document.getElementById('trainLossValue').textContent = data.train_loss?.toFixed(4) || '-';
+                    document.getElementById('valLossValue').textContent = data.val_loss?.toFixed(4) || '-';
+                    document.getElementById('trainAccValue').textContent = data.train_acc?.toFixed(1) + '%' || '-';
+                    document.getElementById('valAccValue').textContent = data.val_acc?.toFixed(1) + '%' || '-';
+                    document.getElementById('bestValLossValue').textContent = data.best_val_loss?.toFixed(4) || '-';
+                    document.getElementById('trainLRValue').textContent = data.learning_rate?.toExponential(3) || '-';
+
+                    // 更新图表
+                    const epochLabel = `第${data.epoch}轮`;
+                    if (!trainingChart.data.labels.includes(epochLabel)) {
+                        trainingChart.data.labels.push(epochLabel);
+                        trainingChart.data.datasets[0].data.push(data.train_loss);
+                        trainingChart.data.datasets[1].data.push(data.val_loss);
+                        trainingChart.data.datasets[2].data.push(data.train_acc);
+                        trainingChart.data.datasets[3].data.push(data.val_acc);
+                        trainingChart.update('none'); // 使用'none'模式减少重绘
+                    }
+                }
+            };
+
+            trainingEventSource.addEventListener('complete', (e) => {
+                const data = JSON.parse(e.data);
+                document.getElementById('trainProgressText').textContent = data.status === 'completed' ? '训练完成' : '训练结束';
+                document.getElementById('startTrainBtn').disabled = false;
+                document.getElementById('startTrainBtn').textContent = '开始训练';
+                trainingEventSource.close();
+                loadModels();
+                loadJobs();
+                log('训练完成', 'success');
+            });
+
+            trainingEventSource.addEventListener('error', (e) => {
+                let msg = '连接出错';
+                try { msg = JSON.parse(e.data).message || msg; } catch (_) {}
+                document.getElementById('trainProgressText').textContent = msg;
+                document.getElementById('startTrainBtn').disabled = false;
+                document.getElementById('startTrainBtn').textContent = '开始训练';
+                trainingEventSource.close();
+                loadJobs();
+            });
+        }
+
+        // 显示训练历史曲线
+        async function showTrainingHistory(asset, modelId) {
+            try {
+                const response = await fetch(`/api/train/history/${asset}/${modelId}`);
+                const data = await response.json();
+
+                if (!response.ok || !data.history) {
+                    alert('加载训练历史失败');
+                    return;
+                }
+
+                const history = data.history;
+                const epochs = history.train_loss.map((_, i) => `第${i + 1}轮`);
+
+                // 创建模态框
+                const modal = document.createElement('div');
+                modal.style.cssText = `
+                    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                    background: rgba(0,0,0,0.5); z-index: 1000;
+                    display: flex; align-items: center; justify-content: center;
+                `;
+
+                modal.innerHTML = `
+                    <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 900px; max-height: 80vh; overflow: auto;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                            <h3 style="margin: 0;">${asset}/${modelId} 训练历史</h3>
+                            <button onclick="this.closest('.modal-overlay').remove()" style="padding: 4px 12px;">关闭</button>
+                        </div>
+                        <div style="height: 400px;">
+                            <canvas id="historyChart"></canvas>
+                        </div>
+                        <div style="margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; font-size: 13px;">
+                            <div>最佳验证Loss: <strong>${data.best_val_loss?.toFixed(4) || '-'}</strong></div>
+                            <div>总轮数: <strong>${data.total_epochs}</strong></div>
+                        </div>
+                    </div>
+                `;
+                modal.className = 'modal-overlay';
+                document.body.appendChild(modal);
+
+                // 绘制历史图表
+                const ctx = document.getElementById('historyChart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: epochs,
+                        datasets: [
+                            {
+                                label: '训练Loss',
+                                data: history.train_loss,
+                                borderColor: '#3498db',
+                                backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                                borderWidth: 2,
+                                pointRadius: 2,
+                                yAxisID: 'y-loss',
+                                tension: 0.3
+                            },
+                            {
+                                label: '验证Loss',
+                                data: history.val_loss,
+                                borderColor: '#e74c3c',
+                                backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                                borderWidth: 2,
+                                pointRadius: 2,
+                                yAxisID: 'y-loss',
+                                tension: 0.3
+                            },
+                            {
+                                label: '训练准确率',
+                                data: history.train_acc,
+                                borderColor: '#27ae60',
+                                borderWidth: 2,
+                                borderDash: [5, 5],
+                                pointRadius: 2,
+                                yAxisID: 'y-acc',
+                                tension: 0.3
+                            },
+                            {
+                                label: '验证准确率',
+                                data: history.val_acc,
+                                borderColor: '#f39c12',
+                                borderWidth: 2,
+                                borderDash: [5, 5],
+                                pointRadius: 2,
+                                yAxisID: 'y-acc',
+                                tension: 0.3
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { mode: 'index', intersect: false },
+                        plugins: {
+                            title: { display: true, text: '完整训练历史' }
+                        },
+                        scales: {
+                            x: { display: true, title: { display: true, text: '轮数' } },
+                            'y-loss': { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Loss' }, min: 0, max: 1 },
+                            'y-acc': { type: 'linear', display: true, position: 'right', title: { display: true, text: '准确率 (%)' }, min: 0, max: 100, grid: { drawOnChartArea: false } }
+                        }
+                    }
+                });
+
+            } catch (e) {
+                console.error('加载训练历史失败:', e);
+                alert('加载训练历史失败');
             }
         }
     </script>

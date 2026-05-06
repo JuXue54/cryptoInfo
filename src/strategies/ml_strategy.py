@@ -47,6 +47,12 @@ class FeatureExtractor:
 
         # 市场结构
         'high_20d_ratio', 'low_20d_ratio',
+
+        # 交易量特征
+        'volume',
+        'volume_ma7', 'volume_ma30',
+        'volume_change',
+        'volume_relative',
     ]
 
     @classmethod
@@ -147,6 +153,28 @@ class FeatureExtractor:
         features['high_20d_ratio'] = close / high_20
         features['low_20d_ratio'] = close / low_20
 
+        # ========== 交易量特征 ==========
+        if 'volume' in df.columns:
+            volume = df['volume']
+            features['volume'] = volume
+
+            # 交易量移动平均
+            features['volume_ma7'] = volume.rolling(window=7).mean()
+            features['volume_ma30'] = volume.rolling(window=30).mean()
+
+            # 交易量变化率
+            features['volume_change'] = volume.pct_change() * 100
+
+            # 相对交易量（当前交易量/近期平均）
+            features['volume_relative'] = volume / (features['volume_ma7'] + 1e-10)
+        else:
+            # 如果没有交易量数据，填充0
+            features['volume'] = 0
+            features['volume_ma7'] = 0
+            features['volume_ma30'] = 0
+            features['volume_change'] = 0
+            features['volume_relative'] = 0
+
         return features
 
     @classmethod
@@ -230,6 +258,8 @@ class MLStrategyBase(PredictionStrategy):
 
     def __init__(self, name: str, description: str,
                  model_path: Optional[str] = None,
+                 asset_code: Optional[str] = None,
+                 model_id: Optional[str] = None,
                  seq_len: int = 60):
         super().__init__(name, description)
 
@@ -243,8 +273,8 @@ class MLStrategyBase(PredictionStrategy):
 
         # 模型
         self.model = None
-        if model_path:
-            self.load_model(model_path)
+        if model_path or asset_code:
+            self.load_model(model_path=model_path, asset_code=asset_code, model_id=model_id)
         else:
             # 初始化默认模型（未训练）
             self._init_default_model()
@@ -264,9 +294,76 @@ class MLStrategyBase(PredictionStrategy):
         self.feature_mean = np.zeros(n_features)
         self.feature_std = np.ones(n_features)
 
-    def load_model(self, model_path: str):
-        """加载预训练模型"""
+    @staticmethod
+    def find_best_model(asset_code: str, model_id: str = None) -> Optional[str]:
+        """
+        查找指定资产的最佳模型路径
+
+        Args:
+            asset_code: 资产代码 (如 'BTC', 'ETH')
+            model_id: 可选的模型标识符，如果为None则查找所有模型中loss最小的
+
+        Returns:
+            最佳模型的文件路径，如果未找到则返回None
+        """
+        import glob
+        import os
+
+        asset_lower = asset_code.lower()
+
+        if model_id:
+            # 查找指定model_id的best模型
+            specific_path = f'models/{asset_lower}_{model_id}_lstm_best.pth'
+            if os.path.exists(specific_path):
+                return specific_path
+            return None
+        else:
+            # 查找该资产所有模型的best模型
+            pattern = f'models/{asset_lower}_*_lstm_best.pth'
+            best_models = glob.glob(pattern)
+
+            if not best_models:
+                return None
+
+            # 比较所有模型的best_val_loss，返回loss最小的
+            best_path = None
+            best_loss = float('inf')
+
+            for model_path in best_models:
+                try:
+                    checkpoint = torch.load(model_path, map_location='cpu')
+                    training_info = checkpoint.get('training_info', {})
+                    val_loss = training_info.get('best_val_loss', float('inf'))
+
+                    if val_loss < best_loss:
+                        best_loss = val_loss
+                        best_path = model_path
+                except Exception:
+                    continue
+
+            return best_path
+
+    def load_model(self, model_path: str = None, asset_code: str = None, model_id: str = None):
+        """
+        加载预训练模型
+
+        Args:
+            model_path: 直接指定模型文件路径（优先级最高）
+            asset_code: 资产代码，用于自动查找最佳模型
+            model_id: 模型标识符，用于指定特定模型
+        """
         try:
+            # 如果未指定路径，尝试自动查找
+            if model_path is None and asset_code:
+                model_path = self.find_best_model(asset_code, model_id)
+                if model_path:
+                    print(f"✓ 自动加载最佳模型: {model_path}")
+
+            if model_path is None or not os.path.exists(model_path):
+                print(f"⚠ 未找到预训练模型，使用默认未训练模型")
+                self._init_default_model()
+                return
+
             checkpoint = torch.load(model_path, map_location=self.device)
 
             # 初始化模型
@@ -277,7 +374,8 @@ class MLStrategyBase(PredictionStrategy):
                 input_size=n_features,
                 hidden_size=model_config.get('hidden_size', 128),
                 num_layers=model_config.get('num_layers', 2),
-                dropout=model_config.get('dropout', 0.2)
+                dropout=model_config.get('dropout', 0.2),
+                forecast_horizon=model_config.get('forecast_horizon', 7)
             ).to(self.device)
 
             self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -287,14 +385,19 @@ class MLStrategyBase(PredictionStrategy):
             self.feature_mean = checkpoint.get('feature_mean', np.zeros(n_features))
             self.feature_std = checkpoint.get('feature_std', np.ones(n_features))
 
+            # 更新策略参数
+            training_info = checkpoint.get('training_info', {})
             self.parameters.update({
                 'model_loaded': True,
                 'model_path': model_path,
-                'device': str(self.device)
+                'device': str(self.device),
+                'best_val_loss': training_info.get('best_val_loss'),
+                'best_epoch': training_info.get('best_epoch'),
+                'model_config': model_config
             })
 
         except Exception as e:
-            print(f"加载模型失败: {e}，使用默认未训练模型")
+            print(f"⚠ 加载模型失败: {e}，使用默认未训练模型")
             self._init_default_model()
 
     def save_model(self, model_path: str, config: Dict = None):

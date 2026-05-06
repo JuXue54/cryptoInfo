@@ -1,8 +1,16 @@
 """配置文件"""
 import os
 
-# 数据库配置
-DB_PATH = os.path.join(os.path.dirname(__file__), "crypto_data.db")
+# 数据库配置 - 支持通过环境变量自定义路径
+# 解决WSL2中Windows程序(PyCharm)访问Linux文件系统的锁冲突问题
+# 使用方法: export CRYPTO_DB_PATH="/mnt/c/Users/你的用户名/data/sqlite/crypto_data.db"
+default_db_path = os.path.expanduser("~/data/sqlite/crypto_data.db")
+DB_PATH = os.environ.get("CRYPTO_DB_PATH", default_db_path)
+
+# 确保数据库目录存在
+data_dir = os.path.dirname(DB_PATH)
+if data_dir:
+    os.makedirs(data_dir, exist_ok=True)
 
 # 支持的加密货币
 SUPPORTED_ASSETS = {

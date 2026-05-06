@@ -9,3 +9,8 @@ venv/
 *.csv
 
 .claude
+
+# Checkpoint files
+checkpoints/
+*.ckpt
+*.pth

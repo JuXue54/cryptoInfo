@@ -28,6 +28,7 @@ class Database:
                     close_price REAL NOT NULL,
                     max_price REAL NOT NULL,
                     min_price REAL NOT NULL,
+                    volume REAL NOT NULL DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(asset_code, currency_code, date)
@@ -98,8 +99,8 @@ class Database:
                 try:
                     cursor.execute("""
                         INSERT OR REPLACE INTO prices
-                        (asset_code, currency_code, date, open_price, close_price, max_price, min_price, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (asset_code, currency_code, date, open_price, close_price, max_price, min_price, volume, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         asset_code.upper(),
                         currency_code.upper(),
@@ -108,6 +109,7 @@ class Database:
                         item['close_price'],
                         item['max_price'],
                         item['min_price'],
+                        item.get('volume', 0),
                         datetime.now().isoformat()
                     ))
                     inserted += 1
@@ -165,7 +167,7 @@ class Database:
         """
         with sqlite3.connect(self.db_path) as conn:
             query = """
-                SELECT date, open_price, close_price, max_price, min_price
+                SELECT date, open_price, close_price, max_price, min_price, volume
                 FROM prices
                 WHERE asset_code = ? AND currency_code = ?
             """

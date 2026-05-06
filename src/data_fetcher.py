@@ -95,6 +95,7 @@ class DataFetcher:
                         'close_price': float(item[4]),
                         'max_price': float(item[2]),
                         'min_price': float(item[3]),
+                        'volume': float(item[5]),
                     })
 
                 # 更新当前时间戳为最后一条数据的时间 + 1天
