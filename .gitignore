@@ -14,3 +14,4 @@ venv/
 checkpoints/
 *.ckpt
 *.pth
+models/*.json
