@@ -1518,6 +1518,7 @@ def list_portfolios():
         except Exception:
             current_price = 0
         stats = db.calculate_portfolio_stats(p['id'], current_price)
+        stats['id'] = p['id']
         result.append(stats)
     return jsonify(result)
 
