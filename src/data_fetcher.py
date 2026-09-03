@@ -1,8 +1,11 @@
 """数据获取模块 - 使用Binance API获取USDT计价的加密货币数据"""
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import time
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class DataFetcher:
@@ -22,6 +25,14 @@ class DataFetcher:
             'Accept': 'application/json',
         })
         self.rate_limit_delay = 0.5
+        # 对限流(429/418)和临时性错误自动重试并退避
+        retry = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[418, 429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
     def _make_request(self, endpoint: str, params: dict) -> dict:
         """发送请求并处理响应"""
@@ -62,9 +73,11 @@ class DataFetcher:
         print(f"从Binance获取 {asset_code} 从 {start_date} 到 {end_date} 的USDT数据...")
 
         try:
-            # 转换日期为毫秒时间戳
-            start_ts = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
-            end_ts = int(datetime.strptime(end_date, '%Y-%m-%d').timestamp() * 1000)
+            # 转换日期为毫秒时间戳（Binance返回UTC时间，统一按UTC解析，避免本地时区错位/丢K线）
+            start_ts = int(datetime.strptime(start_date, '%Y-%m-%d')
+                           .replace(tzinfo=timezone.utc).timestamp() * 1000)
+            end_ts = int(datetime.strptime(end_date, '%Y-%m-%d')
+                         .replace(tzinfo=timezone.utc).timestamp() * 1000)
 
             all_data = []
             current_ts = start_ts
@@ -87,7 +100,7 @@ class DataFetcher:
                 # [开盘时间, 开盘价, 最高价, 最低价, 收盘价, 成交量, 收盘时间, ...]
                 for item in data:
                     timestamp_ms = item[0]
-                    date = datetime.fromtimestamp(timestamp_ms / 1000).strftime('%Y-%m-%d')
+                    date = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
 
                     all_data.append({
                         'date': date,
@@ -133,9 +146,10 @@ class DataFetcher:
             return self.fetch_historical_data(asset_code)
 
         # 计算起始日期（最新日期的下一天）
-        last_dt = datetime.strptime(last_date, '%Y-%m-%d')
-        from_dt = last_dt + timedelta(days=1)
-        to_dt = datetime.now() - timedelta(days=1)  # 昨天
+        # last_date按UTC解读，与to_dt保持同一时区（naive与aware混用无法比较）
+        from_dt = (datetime.strptime(last_date, '%Y-%m-%d')
+                   .replace(tzinfo=timezone.utc) + timedelta(days=1))
+        to_dt = datetime.now(timezone.utc) - timedelta(days=1)  # 昨天(UTC)
 
         if from_dt > to_dt:
             print(f"{asset_code}数据已是最新，无需更新")

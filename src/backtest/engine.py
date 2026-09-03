@@ -91,10 +91,17 @@ class BacktestEngine:
         predictions = []
         total = len(backtest_dates)
 
+        # 若策略支持全量特征预计算（ML策略），一次算好整段历史的特征，
+        # 之后每步只做切片——避免逐步对增长窗口重算全部特征（O(N²) → O(N)）
+        if hasattr(self.strategy, 'set_reference_frame'):
+            self.strategy.set_reference_frame(df)
+
         for i, backtest_date in enumerate(backtest_dates):
             try:
-                # 获取该时间点之前的历史数据
-                history_df = df[df.index <= backtest_date].copy()
+                # 该时间点之前的历史数据：位置切片即可
+                # （无需布尔掩码全扫 + 整表copy，策略只读不写输入）
+                pos = df.index.searchsorted(backtest_date, side='right')
+                history_df = df.iloc[:pos]
                 if len(history_df) < min_history_days:
                     continue
 
@@ -103,8 +110,7 @@ class BacktestEngine:
                 current_date = history_df.index[-1]
 
                 # 获取未来实际价格
-                future_idx = df.index.get_indexer([current_date], method='nearest')[0]
-                future_idx_actual = future_idx + forecast_days
+                future_idx_actual = pos - 1 + forecast_days
 
                 if future_idx_actual >= len(df):
                     continue

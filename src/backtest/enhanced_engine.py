@@ -65,6 +65,7 @@ class EnhancedBacktestEngine:
                      max_position_hold_days: int = 30,
                      rebalance_freq: str = 'daily',
                      min_history_days: int = 90,
+                     forecast_days: int = 7,
                      progress_callback=None,
                      strategy_params: Optional[Dict[str, Any]] = None) -> BacktestResult:
         """
@@ -83,6 +84,7 @@ class EnhancedBacktestEngine:
             max_position_hold_days: 最大持仓天数
             rebalance_freq: 再平衡频率 ('daily', 'weekly', 'signal')
             min_history_days: 最小历史数据天数
+            forecast_days: 每次预测的天数
             progress_callback: 进度回调
             strategy_params: 策略参数
 
@@ -103,6 +105,9 @@ class EnhancedBacktestEngine:
         else:
             end_dt = df.index[-1]
 
+        # 保留完整历史用于策略预热：窗口切掉回测开始前的数据会导致
+        # 特征/指标在窗口早期缺历史（原实现把预热数据整段丢弃了）
+        full_df = df
         df = df[(df.index >= start_dt) & (df.index <= end_dt)]
 
         if len(df) == 0:
@@ -247,13 +252,13 @@ class EnhancedBacktestEngine:
                     position_entry_price = 0
 
             # 再平衡时获取新信号
-            if should_rebalance and i >= min_history_days:
-                history_df = df.iloc[:i+1]
+            history_df = full_df.loc[:date]
+            if should_rebalance and len(history_df) >= min_history_days:
 
                 try:
                     result = self.strategy.predict(
                         history_df,
-                        forecast_days=7,
+                        forecast_days=forecast_days,
                         return_paths=False
                     )
 
@@ -347,14 +352,14 @@ class EnhancedBacktestEngine:
 
                         current_position = target_position
 
-                    # 记录预测
+                    # 记录预测（actual_future_price 在回测结束后统一回填）
                     predictions.append({
                         'date': date.strftime('%Y-%m-%d'),
                         'current_price': current_price,
                         'predicted_price': result.predicted_price_mean,
                         'predicted_up_probability': up_prob,
                         'predicted_down_probability': result.down_probability,
-                        'actual_future_price': current_price,  # 会在后面更新
+                        'actual_future_price': current_price,
                         'position': current_position.value,
                         'capital': capital
                     })
@@ -430,6 +435,24 @@ class EnhancedBacktestEngine:
                 reason="Exit: End of Backtest"
             )
 
+        # 回填每条预测的实际未来价格（否则消费方读到的方向/误差全是无效值）
+        filled_predictions = []
+        for pred in predictions:
+            pos = full_df.index.get_indexer([pd.Timestamp(pred['date'])])[0]
+            future_pos = pos + forecast_days
+            if future_pos >= len(full_df):
+                continue  # 尾部没有未来数据、无法评估的预测直接丢弃
+            actual_price = full_df['close_price'].iloc[future_pos]
+            pred['actual_future_price'] = actual_price
+            pred['actual_future_date'] = full_df.index[future_pos].strftime('%Y-%m-%d')
+            pred['actual_return'] = (actual_price - pred['current_price']) / pred['current_price'] * 100
+            pred['direction_correct'] = bool(
+                (pred['predicted_price'] > pred['current_price'])
+                == (actual_price > pred['current_price'])
+            )
+            filled_predictions.append(pred)
+        predictions = filled_predictions
+
         # 计算最终收益
         final_capital = self.equity_curve[-1]
         total_return = (final_capital - initial_capital) / initial_capital * 100
@@ -444,7 +467,7 @@ class EnhancedBacktestEngine:
             'strategy_name': self.strategy.name,
             'start_date': start_date or df.index[0].strftime('%Y-%m-%d'),
             'end_date': end_date or df.index[-1].strftime('%Y-%m-%d'),
-            'forecast_days': 1,
+            'forecast_days': forecast_days,
             'total_predictions': len(predictions),
             **metrics,
             'predictions': predictions,
@@ -571,10 +594,30 @@ class EnhancedBacktestEngine:
         avg_loss = abs(np.mean([t.pnl for t in losing_trades])) if losing_trades else 1
         profit_loss_ratio = avg_profit / avg_loss if avg_loss > 0 else 0
 
-        # 买入持有基准
+        # 买入持有基准（基于窗口内日线收盘价）
         first_price = df['close_price'].iloc[0]
         last_price = df['close_price'].iloc[-1]
         buy_hold_return = (last_price - first_price) / first_price * 100
+
+        # 基准年化与策略同口径（复利），线性年化会系统性高估多年期收益
+        if total_days > 0 and first_price > 0:
+            buy_hold_annual_return = ((1 + buy_hold_return / 100) ** (365 / total_days) - 1) * 100
+        else:
+            buy_hold_annual_return = 0
+
+        # 基准的波动率/夏普/最大回撤
+        bh_prices = df['close_price'].values
+        if len(bh_prices) > 1:
+            bh_returns = (bh_prices[1:] / bh_prices[:-1] - 1) * 100
+            bh_std = np.std(bh_returns)
+            buy_hold_volatility = bh_std * np.sqrt(365)
+            buy_hold_sharpe = np.mean(bh_returns) / bh_std * np.sqrt(365) if bh_std > 0 else 0
+            bh_peaks = np.maximum.accumulate(bh_prices)
+            buy_hold_max_dd = float(np.max((bh_peaks - bh_prices) / bh_peaks * 100))
+        else:
+            buy_hold_volatility = 0
+            buy_hold_sharpe = 0
+            buy_hold_max_dd = 0
 
         return {
             'direction_accuracy': 50,  # 趋势策略方向准确率不直接适用
@@ -594,10 +637,10 @@ class EnhancedBacktestEngine:
             'win_rate': win_rate,
             'total_trades': len(self.trades),
             'buy_hold_return': buy_hold_return,
-            'buy_hold_annual_return': buy_hold_return * (365 / total_days) if total_days > 0 else 0,
-            'buy_hold_max_drawdown': 0,
-            'buy_hold_volatility': 0,
-            'buy_hold_sharpe': 0,
+            'buy_hold_annual_return': buy_hold_annual_return,
+            'buy_hold_max_drawdown': buy_hold_max_dd,
+            'buy_hold_volatility': buy_hold_volatility,
+            'buy_hold_sharpe': buy_hold_sharpe,
             'period_days': total_days
         }
 

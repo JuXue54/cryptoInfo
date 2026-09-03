@@ -56,7 +56,7 @@ def calculate_metrics(predictions: List[Dict[str, Any]],
     errors = [p['actual_future_price'] - p['predicted_price'] for p in predictions]
     abs_errors = [abs(e) for e in errors]
     pct_errors = [
-        abs(p['actual_future_price'] - p['predicted_price']) / p['current_price'] * 100
+        abs(p['actual_future_price'] - p['predicted_price']) / p['actual_future_price'] * 100
         for p in predictions
     ]
 
@@ -134,6 +134,22 @@ def _calculate_probability_calibration(predictions: List[Dict[str, Any]]) -> flo
     return 0
 
 
+def _max_drawdown(returns_pct: np.ndarray) -> float:
+    """
+    基于复利权益曲线计算最大回撤(%)
+
+    百分比收益率先复合成权益曲线再测峰谷距，
+    直接对收益率cumsum衡量的是百分点差而非资金回撤
+    （例：100→200→100 的收益率为[+100,-100]，cumsum回撤为100%，实际为50%）
+    """
+    if returns_pct is None or len(returns_pct) == 0:
+        return 0.0
+    equity = np.cumprod(1.0 + np.asarray(returns_pct, dtype=float) / 100.0)
+    peaks = np.maximum.accumulate(np.concatenate(([1.0], equity)))[1:]
+    drawdowns = (peaks - equity) / peaks * 100
+    return float(np.max(drawdowns))
+
+
 def _simulate_trading(predictions: List[Dict[str, Any]],
                        long_threshold: float = 60,
                        short_threshold: float = 40,
@@ -159,8 +175,9 @@ def _simulate_trading(predictions: List[Dict[str, Any]],
     positions = []
     position_sizes = []
 
-    # 计算趋势（用于趋势过滤）
-    market_trend = _calculate_market_trend(predictions)
+    # 趋势过滤的参照价：回测起点价格（此后每个点只用当日及之前的价格判断趋势，
+    # 不能用整段期间的终点价格分类——那是未来函数）
+    reference_price = predictions[0]['current_price']
 
     for i, p in enumerate(predictions):
         up_prob = p['predicted_up_probability']
@@ -174,7 +191,8 @@ def _simulate_trading(predictions: List[Dict[str, Any]],
         else:
             base_position = 0  # 观望
 
-        # 趋势过滤
+        # 趋势过滤：用截至当日的涨跌幅判断牛熊
+        market_trend = _classify_trend(p['current_price'], reference_price)
         position = base_position
         if trend_filter == 'bull_only' and position == -1:
             # 牛市中禁止做空
@@ -206,88 +224,66 @@ def _simulate_trading(predictions: List[Dict[str, Any]],
     # 总收益率
     total_return = sum(returns)
 
-    # 夏普比率 (简化版，假设无风险利率为0)
+    # 夏普比率（年化，假设无风险利率为0）：
+    # 用实际平均间隔换算每年的期数再年化，与买入持有基准口径一致
     returns_array = np.array(returns)
-    sharpe = np.mean(returns_array) / np.std(returns_array) if np.std(returns_array) > 0 else 0
+    first_date = pd.to_datetime(predictions[0]['date'])
+    last_date = pd.to_datetime(predictions[-1]['date'])
+    total_days = max(1, (last_date - first_date).days)
+    periods_per_year = 365.0 * len(returns) / total_days
 
-    # 最大回撤
-    cumulative = np.cumsum(returns)
-    max_dd = 0
-    peak = 0
-    for value in cumulative:
-        if value > peak:
-            peak = value
-        drawdown = peak - value
-        if drawdown > max_dd:
-            max_dd = drawdown
+    sharpe = (
+        np.mean(returns_array) / np.std(returns_array) * np.sqrt(periods_per_year)
+        if np.std(returns_array) > 0 else 0
+    )
 
-    # 计算年化收益率 (基于预测间隔天数)
-    if not predictions:
-        annual_return = 0
-        annual_volatility = 0
-        trading_annual_return = 0
-    else:
-        # 计算回测期间的总天数
-        first_date = pd.to_datetime(predictions[0]['date'])
-        last_date = pd.to_datetime(predictions[-1]['date'])
-        total_days = (last_date - first_date).days
+    # 最大回撤（复利权益曲线口径）
+    max_dd = _max_drawdown(returns_array)
 
-        if total_days > 0:
-            # 策略年化收益率
-            trading_annual_return = ((1 + total_return / 100) ** (365 / total_days) - 1) * 100
-            # 年化波动率
-            annual_volatility = np.std(returns_array) * np.sqrt(365 / total_days * len(returns)) if len(returns) > 1 else 0
-        else:
-            trading_annual_return = 0
-            annual_volatility = 0
+    # 策略年化收益率（复利）
+    trading_annual_return = ((1 + total_return / 100) ** (365 / total_days) - 1) * 100
+    # 年化波动率
+    annual_volatility = np.std(returns_array) * np.sqrt(periods_per_year) if len(returns) > 1 else 0
 
-        # 风险价值 VaR (95%置信度)
-        var_95 = np.percentile(returns_array, 5) if len(returns) > 0 else 0
+    # 风险价值 VaR (95%置信度)
+    var_95 = np.percentile(returns_array, 5) if len(returns) > 0 else 0
 
-        # 盈亏比
-        positive_returns = [r for r in returns if r > 0]
-        negative_returns = [r for r in returns if r < 0]
-        profit_loss_ratio = (np.mean(positive_returns) / abs(np.mean(negative_returns))) if negative_returns and positive_returns else 0
+    # 盈亏比
+    positive_returns = [r for r in returns if r > 0]
+    negative_returns = [r for r in returns if r < 0]
+    profit_loss_ratio = (np.mean(positive_returns) / abs(np.mean(negative_returns))) if negative_returns and positive_returns else 0
 
-        # 胜率
-        win_rate = len(positive_returns) / len(returns) * 100 if returns else 0
+    # 胜率（分母只计实际持仓产生盈亏的期，观望期不计入）
+    decisive_returns = [r for r in returns if r != 0]
+    win_rate = len(positive_returns) / len(decisive_returns) * 100 if decisive_returns else 0
 
-        return {
-            'trading_return': total_return,
-            'trading_annual_return': trading_annual_return,
-            'trading_sharpe': sharpe,
-            'max_drawdown': max_dd,
-            'annual_volatility': annual_volatility,
-            'var_95': var_95,
-            'profit_loss_ratio': profit_loss_ratio,
-            'win_rate': win_rate,
-            'total_trades': len([p for p in positions if p != 0])
-        }
+    return {
+        'trading_return': total_return,
+        'trading_annual_return': trading_annual_return,
+        'trading_sharpe': sharpe,
+        'max_drawdown': max_dd,
+        'annual_volatility': annual_volatility,
+        'var_95': var_95,
+        'profit_loss_ratio': profit_loss_ratio,
+        'win_rate': win_rate,
+        'total_trades': len([p for p in positions if p != 0])
+    }
 
 
-def _calculate_market_trend(predictions: List[Dict[str, Any]]) -> str:
+def _classify_trend(current_price: float, reference_price: float) -> str:
     """
-    计算市场趋势
+    根据截至当日（相对参照价）的涨跌幅判断市场趋势
 
-    Args:
-        predictions: 预测记录列表
+    只使用当前时点已知的价格，避免未来函数
 
     Returns:
         str: 'bull', 'bear', 或 'neutral'
     """
-    if not predictions:
-        return 'neutral'
+    price_change = (current_price - reference_price) / reference_price * 100
 
-    # 使用第一个和最后一个预测点的价格变化判断趋势
-    first_price = predictions[0]['current_price']
-    last_price = predictions[-1]['actual_future_price']
-
-    price_change = (last_price - first_price) / first_price * 100
-
-    # 根据总变化判断趋势
-    if price_change > 50:  # 期间涨幅超过50%认为是牛市
+    if price_change > 50:  # 涨幅超过50%认为是牛市
         return 'bull'
-    elif price_change < -30:  # 期间跌幅超过30%认为是熊市
+    elif price_change < -30:  # 跌幅超过30%认为是熊市
         return 'bear'
     else:
         return 'neutral'
@@ -318,7 +314,7 @@ def _calculate_buy_hold_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, 
     # 总收益率
     total_return = (last_price - first_price) / first_price * 100
 
-    # 计算期间日收益率序列（用于计算波动率和回撤）
+    # 计算期间收益率序列（用于计算波动率和回撤）
     daily_returns = []
     prices = [p['current_price'] for p in predictions] + [predictions[-1]['actual_future_price']]
 
@@ -333,25 +329,21 @@ def _calculate_buy_hold_metrics(predictions: List[Dict[str, Any]]) -> Dict[str, 
     last_date = pd.to_datetime(predictions[-1]['actual_future_date'] if 'actual_future_date' in predictions[-1] else predictions[-1]['date'])
     total_days = max(1, (last_date - first_date).days)
 
-    # 年化收益率
+    # 每年的期数：这些"日"收益率实际是按预测步长间隔采样的，
+    # 年化系数必须用实际间隔换算（原实现固定×sqrt(365)会高估约sqrt(步长)倍）
+    periods_per_year = 365.0 * len(returns_array) / total_days
+
+    # 年化收益率（复利）
     annual_return = ((1 + total_return / 100) ** (365 / total_days) - 1) * 100
 
     # 年化波动率
-    annual_volatility = np.std(returns_array) * np.sqrt(365) if len(returns_array) > 1 else 0
+    annual_volatility = np.std(returns_array) * np.sqrt(periods_per_year) if len(returns_array) > 1 else 0
 
-    # 夏普比率 (简化版)
-    sharpe = np.mean(returns_array) / np.std(returns_array) * np.sqrt(365) if np.std(returns_array) > 0 else 0
+    # 夏普比率（年化，与策略侧同口径）
+    sharpe = np.mean(returns_array) / np.std(returns_array) * np.sqrt(periods_per_year) if np.std(returns_array) > 0 else 0
 
-    # 最大回撤
-    cumulative = np.cumsum(returns_array)
-    max_dd = 0
-    peak = 0
-    for value in cumulative:
-        if value > peak:
-            peak = value
-        drawdown = peak - value
-        if drawdown > max_dd:
-            max_dd = drawdown
+    # 最大回撤（复利权益曲线口径）
+    max_dd = _max_drawdown(returns_array)
 
     # 相对于买入持有的超额收益
     strategy_return = sum([p['actual_return'] for p in predictions]) if predictions else 0

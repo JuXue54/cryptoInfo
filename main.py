@@ -50,7 +50,7 @@ def update_data(asset_code: str = None, currency_code: str = DEFAULT_CURRENCY):
 
         try:
             # 获取增量数据
-            new_data = fetcher.fetch_incremental_data(asset, currency_code, latest_date)
+            new_data = fetcher.fetch_incremental_data(asset, latest_date)
 
             if new_data:
                 # 保存到数据库

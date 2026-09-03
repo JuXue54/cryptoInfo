@@ -1,6 +1,6 @@
 """Yahoo Finance数据获取模块 - 获取更多历史数据（10年以上）"""
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import pandas as pd
 import time
@@ -43,7 +43,7 @@ class YahooDataFetcher:
 
         # 设置默认日期范围
         if end_date is None:
-            end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            end_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
 
         if start_date is None:
             # 默认获取10年数据
@@ -69,19 +69,27 @@ class YahooDataFetcher:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # 重命名列以匹配我们的格式
-            result = []
-            for date, row in df.iterrows():
-                result.append({
-                    'date': date.strftime('%Y-%m-%d'),
-                    'open_price': float(row['Open']),
-                    'close_price': float(row['Close']),
-                    'max_price': float(row['High']),
-                    'min_price': float(row['Low']),
-                })
+            # 向量化转换为标准格式（含成交量）
+            col_map = {
+                'Open': 'open_price',
+                'Close': 'close_price',
+                'High': 'max_price',
+                'Low': 'min_price',
+                'Volume': 'volume',
+            }
+            result_df = df.rename(columns=col_map)
+            result_df = result_df[[c for c in col_map.values() if c in result_df.columns]].copy()
+            result_df.insert(0, 'date', df.index.strftime('%Y-%m-%d'))
+
+            # 丢弃缺OHLC的行，成交量缺失补0
+            result_df = result_df.dropna(
+                subset=[c for c in ['open_price', 'close_price', 'max_price', 'min_price'] if c in result_df.columns]
+            )
+            if 'volume' in result_df.columns:
+                result_df['volume'] = result_df['volume'].fillna(0)
 
             time.sleep(self.rate_limit_delay)
-            return result
+            return result_df.to_dict('records')
 
         except Exception as e:
             print(f"从Yahoo Finance获取数据失败: {e}")
@@ -104,9 +112,10 @@ class YahooDataFetcher:
             return self.fetch_historical_data(asset_code)
 
         # 计算起始日期（最新日期的下一天）
-        last_dt = datetime.strptime(last_date, '%Y-%m-%d')
-        from_dt = last_dt + timedelta(days=1)
-        to_dt = datetime.now() - timedelta(days=1)  # 昨天
+        # last_date按UTC解读，与to_dt保持同一时区（naive与aware混用无法比较）
+        from_dt = (datetime.strptime(last_date, '%Y-%m-%d')
+                   .replace(tzinfo=timezone.utc) + timedelta(days=1))
+        to_dt = datetime.now(timezone.utc) - timedelta(days=1)  # 昨天(UTC)
 
         if from_dt > to_dt:
             print(f"{asset_code}数据已是最新，无需更新")

@@ -69,7 +69,7 @@ def get_latest_checkpoint(asset_code, model_id='default'):
 
 
 def save_checkpoint(checkpoint_dir, epoch, model, optimizer, scheduler, scaler,
-                    best_val_loss, history, config):
+                    best_val_loss, history, config, epochs_no_improve=0):
     """保存训练checkpoint"""
     checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
 
@@ -81,6 +81,7 @@ def save_checkpoint(checkpoint_dir, epoch, model, optimizer, scheduler, scaler,
         'feature_mean': scaler.mean_,
         'feature_std': scaler.scale_,
         'best_val_loss': best_val_loss,
+        'epochs_no_improve': epochs_no_improve,
         'history': history,
         'config': config,
         'saved_at': datetime.now().isoformat()
@@ -145,7 +146,6 @@ def prepare_data(asset_code='BTC', start_date=None, forecast_horizon=7,
 
     # 提取特征
     features_df = FeatureExtractor.extract_features(df)
-    features_df = features_df.fillna(0)
 
     # 准备目标变量
     # 未来N日收益率
@@ -155,27 +155,45 @@ def prepare_data(asset_code='BTC', start_date=None, forecast_horizon=7,
     # 波动率（使用未来N日的实际波动率）
     future_volatility = df['close_price'].pct_change().rolling(forecast_horizon).std().shift(-forecast_horizon)
 
+    # 只保留特征与目标都有效的行：
+    # - 前部长窗口指标为NaN（如90日均线），不能用0填充参与统计
+    # - 尾部forecast_horizon行没有未来数据，填充0会让模型学到虚假的"平盘/下跌"
+    valid_mask = (
+        features_df[FeatureExtractor.FEATURE_NAMES].notna().all(axis=1)
+        & future_returns.notna()
+        & future_volatility.notna()
+    )
+    features_df = features_df[valid_mask]
+    future_returns = future_returns[valid_mask]
+    up_label = up_label[valid_mask]
+    future_volatility = future_volatility[valid_mask]
+
     # 组合目标 [return, up_prob, volatility]
     targets = np.column_stack([
-        future_returns.fillna(0).values,
-        up_label.fillna(0).values,
-        future_volatility.fillna(0).values * np.sqrt(365)  # 年化波动率
+        future_returns.values,
+        up_label.values,
+        future_volatility.values * np.sqrt(365)  # 年化波动率
     ])
 
-    # 标准化特征
     feature_values = features_df[FeatureExtractor.FEATURE_NAMES].values
-    scaler = StandardScaler()
-    feature_values_scaled = scaler.fit_transform(feature_values)
 
     # 划分训练/验证集（时间序列划分）
-    n_samples = len(feature_values_scaled) - seq_len  # 减去序列长度
+    n_samples = len(feature_values) - seq_len  # 减去序列长度
     train_size = int(n_samples * train_ratio)
+
+    # 标准化只拟合训练段数据：在全量数据上拟合会让验证集统计量
+    # 泄漏进训练过程，导致val_loss偏乐观（影响早停与模型选择）
+    scaler = StandardScaler()
+    scaler.fit(feature_values[:train_size + seq_len])
+    feature_values_scaled = scaler.transform(feature_values)
 
     train_features = feature_values_scaled[:train_size + seq_len]
     train_targets = targets[:train_size + seq_len]
 
-    val_features = feature_values_scaled[train_size:]
-    val_targets = targets[train_size:]
+    # 训练/验证之间空出seq_len行，否则验证集前几个输入窗口
+    # 与训练样本逐行相同（自相关强时验证指标虚高）
+    val_features = feature_values_scaled[train_size + seq_len:]
+    val_targets = targets[train_size + seq_len:]
 
     print(f"训练集样本: {len(train_features) - seq_len}")
     print(f"验证集样本: {len(val_features) - seq_len}")
@@ -291,6 +309,7 @@ def train_model(asset_code='BTC', epochs=50, lr=0.001, device=None,
     start_epoch = 1
     best_val_loss = float('inf')
     best_checkpoint = None
+    val_loss = None
     history = {
         'train_loss': [],
         'val_loss': [],
@@ -315,10 +334,24 @@ def train_model(asset_code='BTC', epochs=50, lr=0.001, device=None,
             start_epoch = checkpoint['epoch'] + 1
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
             history = checkpoint.get('history', history)
+            epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+
+            # 恢复早停计数：否则续训会把耐心值重置，可能比真实早停点多训练
+            # 恢复特征标准化统计量：已加载的权重是在这套统计量下训练的，
+            # 若期间新增了数据，重新拟合的scaler会与权重不匹配
+            saved_mean = checkpoint.get('feature_mean')
+            saved_std = checkpoint.get('feature_std')
+            if (saved_mean is not None and saved_std is not None
+                    and len(saved_mean) == len(scaler.mean_)):
+                scaler.mean_ = np.asarray(saved_mean)
+                scaler.scale_ = np.asarray(saved_std)
+                print("  已恢复checkpoint中的特征标准化统计量")
+
             # 恢复模型配置
             config = checkpoint.get('config', {})
             print(f"  从第 {start_epoch} 轮继续训练")
             print(f"  当前最佳验证损失: {best_val_loss:.4f}")
+            print(f"  早停计数: {epochs_no_improve}")
         else:
             print("\n[警告] 未找到checkpoint，从头开始训练")
 
@@ -506,7 +539,7 @@ def train_model(asset_code='BTC', epochs=50, lr=0.001, device=None,
             }
             ckpt_path = save_checkpoint(
                 checkpoint_dir, epoch, model, optimizer, scheduler, scaler,
-                best_val_loss, history, config
+                best_val_loss, history, config, epochs_no_improve
             )
             print(f"  💾 Checkpoint: {ckpt_path}")
 

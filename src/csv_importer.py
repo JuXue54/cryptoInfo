@@ -91,16 +91,15 @@ class CSVImporter:
         else:
             df['date'] = pd.to_datetime(df['date'])
 
-        # 转换为标准格式
-        result = []
-        for _, row in df.iterrows():
-            result.append({
-                'date': row['date'].strftime('%Y-%m-%d'),
-                'open_price': float(row['open']),
-                'close_price': float(row['close']),
-                'max_price': float(row['high']),
-                'min_price': float(row['low']),
-            })
+        # 向量化转换为标准格式
+        result_df = pd.DataFrame({
+            'date': df['date'].dt.strftime('%Y-%m-%d'),
+            'open_price': df['open'].astype(float),
+            'close_price': df['close'].astype(float),
+            'max_price': df['high'].astype(float),
+            'min_price': df['low'].astype(float),
+        })
+        result = result_df.to_dict('records')
 
         print(f"成功从CSV导入 {len(result)} 条 {asset_code} 数据")
         return result

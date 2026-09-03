@@ -16,8 +16,10 @@ class Database:
 
     def _init_db(self):
         """初始化数据库表结构"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
+            # WAL模式：读写不互相阻塞，缓解并发访问时的 database is locked
+            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS prices (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,11 +36,9 @@ class Database:
                     UNIQUE(asset_code, currency_code, date)
                 )
             """)
-            # 创建索引以加速查询
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_prices_asset_date
-                ON prices(asset_code, currency_code, date)
-            """)
+            # UNIQUE 约束已自带 (asset_code, currency_code, date) 的隐式索引，
+            # 显式索引完全重复，只会放大写入开销，删除之
+            cursor.execute("DROP INDEX IF EXISTS idx_prices_asset_date")
 
             # ======= 模拟持仓表 =======
             # 模拟仓位主表
@@ -79,6 +79,19 @@ class Database:
             """)
             conn.commit()
 
+    def get_latest_price(self, asset_code: str,
+                         currency_code: str = 'USDT') -> Optional[float]:
+        """获取某币种最新收盘价（避免为读一个价格而全量加载历史数据）"""
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT close_price FROM prices
+                WHERE asset_code = ? AND currency_code = ?
+                ORDER BY date DESC LIMIT 1
+            """, (asset_code.upper(), currency_code.upper()))
+            row = cursor.fetchone()
+            return row[0] if row else None
+
     def save_price_data(self, asset_code: str, currency_code: str,
                         data: List[Dict]) -> int:
         """
@@ -92,31 +105,38 @@ class Database:
         Returns:
             插入的记录数
         """
-        with sqlite3.connect(self.db_path) as conn:
+        now = datetime.now().isoformat()
+        rows = [(
+            asset_code.upper(),
+            currency_code.upper(),
+            item['date'],
+            item['open_price'],
+            item['close_price'],
+            item['max_price'],
+            item['min_price'],
+            item.get('volume', 0),
+            now,
+        ) for item in data]
+
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
-            inserted = 0
-            for item in data:
-                try:
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO prices
-                        (asset_code, currency_code, date, open_price, close_price, max_price, min_price, volume, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        asset_code.upper(),
-                        currency_code.upper(),
-                        item['date'],
-                        item['open_price'],
-                        item['close_price'],
-                        item['max_price'],
-                        item['min_price'],
-                        item.get('volume', 0),
-                        datetime.now().isoformat()
-                    ))
-                    inserted += 1
-                except sqlite3.Error as e:
-                    print(f"插入数据失败: {e}, 数据: {item}")
+            # ON CONFLICT DO UPDATE 只更新冲突行，不像 INSERT OR REPLACE 那样
+            # 删除再插入（保留 created_at，也少维护一次索引）
+            cursor.executemany("""
+                INSERT INTO prices
+                    (asset_code, currency_code, date, open_price, close_price,
+                     max_price, min_price, volume, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_code, currency_code, date) DO UPDATE SET
+                    open_price = excluded.open_price,
+                    close_price = excluded.close_price,
+                    max_price = excluded.max_price,
+                    min_price = excluded.min_price,
+                    volume = excluded.volume,
+                    updated_at = excluded.updated_at
+            """, rows)
             conn.commit()
-            return inserted
+            return len(rows)
 
     def get_latest_date(self, asset_code: str, currency_code: str) -> Optional[str]:
         """
@@ -125,7 +145,7 @@ class Database:
         Returns:
             最新日期字符串(YYYY-MM-DD)，如果没有数据返回None
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT MAX(date) FROM prices
@@ -141,7 +161,7 @@ class Database:
         Returns:
             最早日期字符串(YYYY-MM-DD)，如果没有数据返回None
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT MIN(date) FROM prices
@@ -165,7 +185,7 @@ class Database:
         Returns:
             pandas DataFrame，包含价格数据
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             query = """
                 SELECT date, open_price, close_price, max_price, min_price, volume
                 FROM prices
@@ -189,7 +209,7 @@ class Database:
 
     def get_all_assets(self) -> List[Tuple[str, str]]:
         """获取所有已存储的币种和计价货币组合"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT DISTINCT asset_code, currency_code FROM prices
@@ -198,7 +218,7 @@ class Database:
 
     def get_data_summary(self, asset_code: str, currency_code: str) -> Dict:
         """获取数据摘要信息"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT COUNT(*), MIN(date), MAX(date), MIN(min_price), MAX(max_price)
@@ -220,7 +240,7 @@ class Database:
                          initial_capital: float, strategy: str = None,
                          description: str = None) -> int:
         """创建模拟仓位，返回仓位ID"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO portfolios (name, asset_code, mode, strategy, initial_capital, description)
@@ -231,7 +251,7 @@ class Database:
 
     def get_all_portfolios(self) -> List[Dict]:
         """获取所有模拟仓位"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM portfolios ORDER BY created_at DESC")
@@ -239,7 +259,7 @@ class Database:
 
     def get_portfolio(self, portfolio_id: int) -> Optional[Dict]:
         """获取单个仓位信息"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,))
@@ -248,7 +268,7 @@ class Database:
 
     def delete_portfolio(self, portfolio_id: int):
         """删除仓位及所有交易记录"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM portfolio_trades WHERE portfolio_id = ?", (portfolio_id,))
             cursor.execute("DELETE FROM portfolios WHERE id = ?", (portfolio_id,))
@@ -259,7 +279,7 @@ class Database:
                   note: str = None) -> int:
         """添加交易记录（buy/sell），返回记录ID"""
         amount = price * quantity
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO portfolio_trades (portfolio_id, trade_date, trade_type, price, quantity, amount, fee, note)
@@ -273,7 +293,7 @@ class Database:
 
     def get_trades(self, portfolio_id: int) -> List[Dict]:
         """获取仓位的所有交易记录"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
@@ -285,7 +305,7 @@ class Database:
 
     def delete_trade(self, trade_id: int):
         """删除单条交易记录"""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM portfolio_trades WHERE id = ?", (trade_id,))
             conn.commit()

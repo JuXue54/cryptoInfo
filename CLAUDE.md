@@ -12,7 +12,8 @@ A cryptocurrency price tracking and analysis tool (Chinese language UI). Support
 ```bash
 python app.py
 ```
-Runs Flask on port 5001. The app bundles both REST API and embedded HTML/JS frontend.
+Runs Flask on port 5001. REST API plus single-page frontend served from `templates/index.html`.
+Listens on 127.0.0.1 with debug off by default; override with `CRYPTO_HOST` / `CRYPTO_DEBUG=1`.
 
 ### Update Price Data
 ```bash
@@ -93,7 +94,7 @@ Two engines with different trade semantics:
 
 ### Web Application (`app.py`)
 
-A monolithic Flask file (~200KB). Serves both REST API and an embedded single-page frontend using Lightweight Charts. Key API groups:
+Flask REST API (~1800 lines); the single-page frontend (Lightweight Charts + Chart.js) lives in `templates/index.html`. Key API groups:
 
 - `/api/data/<asset>` — OHLC data with optional MA
 - `/api/predict/<asset>` — Strategy predictions (Monte Carlo / Trend / LSTM)
@@ -102,7 +103,7 @@ A monolithic Flask file (~200KB). Serves both REST API and an embedded single-pa
 - `/api/train/*` — LSTM training job management (async with progress streaming)
 - `/api/portfolios/*` — Paper trading CRUD + equity curve
 
-Training jobs run in background threads with a `training_jobs` dict and `queue.Queue` for progress streaming.
+Training jobs run in background threads with a `training_jobs` dict and `queue.Queue` for SSE streaming. Job progress/history is updated by the producer callback (works even with no SSE client attached); one running job per asset+model_id (409 on duplicates). Price reads go through a small `(asset, currency, latest_date)`-keyed cache that self-invalidates when new data lands.
 
 ### LSTM Training (`scripts/train_model.py`)
 

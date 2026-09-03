@@ -279,6 +279,9 @@ class MLStrategyBase(PredictionStrategy):
             # 初始化默认模型（未训练）
             self._init_default_model()
 
+        # 回测用的全量特征缓存（见 set_reference_frame）
+        self._reference_features = None
+
     def _init_default_model(self):
         """初始化默认模型（用于测试或未训练状态）"""
         n_features = len(FeatureExtractor.get_feature_names())
@@ -414,6 +417,25 @@ class MLStrategyBase(PredictionStrategy):
         """标准化特征"""
         return (features - self.feature_mean) / (self.feature_std + 1e-8)
 
+    def set_reference_frame(self, df: pd.DataFrame):
+        """
+        预计算整段历史的特征，供回测引擎复用
+
+        所有特征都是因果的（rolling/ewm/shift，只依赖截至当日的数据），
+        因此任意截点上的特征值与"只用截至该日数据重新计算"的结果一致。
+        回测每步窗口是全量数据的前缀，直接切片即可，无需逐步重算35个特征。
+        """
+        self._reference_features = FeatureExtractor.extract_features(df)
+
+    def _features_for(self, df: pd.DataFrame) -> pd.DataFrame:
+        """优先从预计算缓存中切片取特征；窗口不匹配时回退到现算"""
+        ref = self._reference_features
+        if ref is not None and 0 < len(df) <= len(ref):
+            n = len(df)
+            if df.index.equals(ref.index[:n]):
+                return ref.iloc[:n]
+        return FeatureExtractor.extract_features(df)
+
     def predict(self, df: pd.DataFrame, forecast_days: int = 7,
                 **kwargs) -> StrategyResult:
         """
@@ -429,8 +451,8 @@ class MLStrategyBase(PredictionStrategy):
         if not self.validate_data(df):
             raise ValueError("Invalid input data")
 
-        # 提取特征
-        features_df = FeatureExtractor.extract_features(df)
+        # 提取特征（回测时命中预计算缓存）
+        features_df = self._features_for(df)
         features_df = features_df.fillna(0)  # 填充缺失值
 
         # 获取最近seq_len个时间步
@@ -534,11 +556,15 @@ class LSTMStrategy(MLStrategyBase):
     def __init__(self, model_path: Optional[str] = None,
                  seq_len: int = 60,
                  hidden_size: int = 128,
-                 num_layers: int = 2):
+                 num_layers: int = 2,
+                 asset_code: Optional[str] = None,
+                 model_id: Optional[str] = None):
         super().__init__(
             name="LSTM",
-            description="基于LSTM深度学习的BTC价格预测策略，使用20+技术指标特征",
+            description="基于LSTM深度学习的价格预测策略，使用20+技术指标特征",
             model_path=model_path,
+            asset_code=asset_code,
+            model_id=model_id,
             seq_len=seq_len
         )
 

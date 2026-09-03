@@ -4,7 +4,7 @@
 """
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
 
@@ -31,17 +31,24 @@ class PredictionResult:
 class BTCPredictor:
     """BTC价格预测器"""
 
-    def __init__(self, forecast_days: int = 7, n_simulations: int = 10000):
+    def __init__(self, forecast_days: int = 7, n_simulations: int = 10000,
+                 asset_code: str = 'BTC', db: Optional[Database] = None,
+                 currency_code: str = 'USDT'):
         """
         初始化预测器
 
         Args:
             forecast_days: 预测天数，默认7天（一周）
             n_simulations: 蒙特卡洛模拟次数，默认10000次
+            asset_code: 资产代码，默认BTC
+            db: 可复用的数据库实例（不传则自建）
+            currency_code: 计价货币
         """
         self.forecast_days = forecast_days
         self.n_simulations = n_simulations
-        self.db = Database()
+        self.asset_code = asset_code.upper()
+        self.currency_code = currency_code.upper()
+        self.db = db if db is not None else Database()
 
     def fetch_data(self, days: int = 365) -> pd.DataFrame:
         """
@@ -53,10 +60,11 @@ class BTCPredictor:
         Returns:
             DataFrame with OHLCV data
         """
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        now = datetime.now(timezone.utc)
+        end_date = now.strftime('%Y-%m-%d')
+        start_date = (now - timedelta(days=days)).strftime('%Y-%m-%d')
 
-        df = self.db.get_price_data('BTC', 'USDT', start_date, end_date)
+        df = self.db.get_price_data(self.asset_code, self.currency_code, start_date, end_date)
         return df
 
     def calculate_returns(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -182,16 +190,18 @@ class BTCPredictor:
 
         return signals
 
-    def monte_carlo_simulation(self, df: pd.DataFrame, use_trend: bool = True) -> np.ndarray:
+    def monte_carlo_simulation(self, df: pd.DataFrame, use_trend: bool = True,
+                               signals: Optional[Dict] = None) -> np.ndarray:
         """
         蒙特卡洛模拟价格路径
 
         Args:
             df: 历史价格数据
             use_trend: 是否考虑当前趋势
+            signals: 已计算好的技术指标（避免重复计算整条指标管线）
 
         Returns:
-            模拟路径数组 (n_simulations x forecast_days)
+            模拟路径数组 (forecast_days x n_simulations)
         """
         returns = self.calculate_returns(df)
 
@@ -202,7 +212,8 @@ class BTCPredictor:
 
         # 根据技术指标调整漂移率
         if use_trend:
-            signals = self.calculate_technical_indicators(df)
+            if signals is None:
+                signals = self.calculate_technical_indicators(df)
             # 将综合评分转换为漂移率调整 (-0.5% 到 +0.5% 每日)
             trend_adjustment = signals['composite_score'] / 100 * 0.005
             mu += trend_adjustment
@@ -210,21 +221,13 @@ class BTCPredictor:
         # 当前价格
         current_price = df['close_price'].iloc[-1]
 
-        # 生成随机路径
-        # 使用几何布朗运动模型: dS/S = mu*dt + sigma*dW
-        dt = 1  # 每日
+        # 生成随机路径（几何布朗运动，向量化）:
+        # dS/S = mu*dt + sigma*dW，逐步累乘等价于 cumprod
         random_shocks = np.random.standard_normal((self.forecast_days, self.n_simulations))
+        increments = np.exp((mu - 0.5 * sigma**2) + sigma * random_shocks)
+        price_paths = current_price * np.cumprod(increments, axis=0)
 
-        # 计算价格路径
-        price_paths = np.zeros((self.forecast_days + 1, self.n_simulations))
-        price_paths[0] = current_price
-
-        for t in range(1, self.forecast_days + 1):
-            price_paths[t] = price_paths[t-1] * np.exp(
-                (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * random_shocks[t-1]
-            )
-
-        return price_paths[1:]  # 返回未来forecast_days的路径（不包括当前价格）
+        return price_paths  # 未来forecast_days的路径（不包括当前价格）
 
     def predict(self, use_trend: bool = True) -> PredictionResult:
         """
@@ -244,11 +247,11 @@ class BTCPredictor:
 
         current_price = df['close_price'].iloc[-1]
 
-        # 计算技术指标
+        # 计算技术指标（只算一次，传给蒙特卡洛复用）
         signals = self.calculate_technical_indicators(df)
 
         # 蒙特卡洛模拟
-        simulation_paths = self.monte_carlo_simulation(df, use_trend=use_trend)
+        simulation_paths = self.monte_carlo_simulation(df, use_trend=use_trend, signals=signals)
 
         # 最终价格分布
         final_prices = simulation_paths[-1]
@@ -285,8 +288,9 @@ class BTCPredictor:
             technical_signals=signals
         )
 
-    def get_recommendation(self, result: PredictionResult) -> str:
-        """根据预测结果生成建议"""
+    @staticmethod
+    def get_recommendation(result: PredictionResult) -> str:
+        """根据预测结果生成建议（纯函数，无需实例化预测器）"""
         signals = result.technical_signals
 
         recommendation = []
@@ -351,9 +355,8 @@ def print_prediction_report(result: PredictionResult):
     print(f"   近30日涨跌: {signals['price_change_30d']:+.2f}%")
     print(f"   综合评分: {signals['composite_score']:+.0f} ({signals['composite_signal']})")
 
-    predictor = BTCPredictor()
     print(f"\n[投资建议]")
-    print(predictor.get_recommendation(result))
+    print(BTCPredictor.get_recommendation(result))
 
     print("=" * 60)
 
